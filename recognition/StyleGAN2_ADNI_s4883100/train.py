@@ -1,0 +1,1 @@
+"""Training, validation, checkpointing, and loss/metric plotting for StyleGAN2 and the WGAN-GP baseline."""

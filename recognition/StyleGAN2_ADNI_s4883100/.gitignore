@@ -1,0 +1,17 @@
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# Training outputs and Slurm logs
+outputs/
+*.out
+*.err
+
+# Data (never commit)
+data/
+
+# Python cruft
+__pycache__/
+*.pyc

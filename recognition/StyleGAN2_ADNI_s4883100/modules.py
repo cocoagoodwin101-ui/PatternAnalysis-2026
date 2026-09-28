@@ -1,0 +1,1 @@
+"""StyleGAN2 generator, mapping network, and discriminator components, implemented in PyTorch."""
