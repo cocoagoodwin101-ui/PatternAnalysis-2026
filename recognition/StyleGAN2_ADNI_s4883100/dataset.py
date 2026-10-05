@@ -4,8 +4,9 @@ Pipeline (see README Section 5):
     1. Index every slice and attach the patient ID from the ADNI metadata JSON.
     2. Split patients 80/10/10 into train/val/test, stratified by label, with a fixed seed.
        The provided train/test folders are ignored because they leak patients across splits.
-    3. Zero-pad each 256 W x 240 H slice to 256 x 256, then resize (antialiased) to the
-       working resolution.
+    3. Zero-pad each 256 W x 240 H slice to 256 x 256, crop to a fixed square around the
+       dataset-wide brain extent (ADNI_CROP, measured by data_audit.py), then resize
+       (antialiased) to the working resolution.
     4. Preload all slices into memory as uint8 (optionally cached to disk) and scale to
        [-1, 1] per item.
 
@@ -37,6 +38,11 @@ from torch.utils.data import DataLoader, Dataset
 ADNI_ROOT = "/home/groups/comp3710/ADNI"
 OASIS_GLOB = "/home/groups/comp3710/OASIS/keras_png_slices_train/*.png"  # confirm against your Lab 2 path
 DEFAULT_CACHE = os.path.expanduser("~/.cache/stylegan2_adni")
+
+# Fixed brain crop (top, left, size) in padded 256 x 256 coordinates, measured over all
+# 30,520 slices by data_audit.py. One crop for every image, so brain size and position
+# are never altered per image. Set to None to disable cropping.
+ADNI_CROP = None  # TODO: replace with the value printed by data_audit.py
 DEFAULT_SEED = 42
 DEFAULT_FRACTIONS = (0.8, 0.1, 0.1)
 SPLITS = ("train", "val", "test")
@@ -139,9 +145,17 @@ def pad_to_square(x):
     return F.pad(x, (left, size - w - left, top, size - h - top), value=0)
 
 
-def preprocess(x, resolution):
-    """Pad a uint8 (1, H, W) slice to square and resize it to uint8 (1, R, R)."""
+def preprocess(x, resolution, crop=None):
+    """Pad a uint8 (1, H, W) slice to square, optionally crop, and resize to uint8 (1, R, R).
+
+    crop is (top, left, size) in padded coordinates, or None for no crop.
+    """
     x = pad_to_square(x)
+    if crop is not None:
+        top, left, size = crop
+        if top < 0 or left < 0 or top + size > x.shape[-2] or left + size > x.shape[-1]:
+            raise ValueError(f"crop {crop} falls outside the padded {tuple(x.shape[-2:])} image")
+        x = x[..., top:top + size, left:left + size]
     if x.shape[-1] != resolution:
         x = TF.resize(x.float(), [resolution, resolution], antialias=True)
         x = x.round().clamp(0, 255).to(torch.uint8)
@@ -151,8 +165,8 @@ def preprocess(x, resolution):
 class _SliceFiles(Dataset):
     """Reads and preprocesses image files; used only to parallelise preloading."""
 
-    def __init__(self, paths, resolution):
-        self.paths, self.resolution = paths, resolution
+    def __init__(self, paths, resolution, crop=None):
+        self.paths, self.resolution, self.crop = paths, resolution, crop
 
     def __len__(self):
         return len(self.paths)
@@ -160,7 +174,7 @@ class _SliceFiles(Dataset):
     def __getitem__(self, i):
         with Image.open(self.paths[i]) as im:
             x = TF.pil_to_tensor(im.convert("L"))  # uint8 (1, H, W)
-        return preprocess(x, self.resolution)
+        return preprocess(x, self.resolution, self.crop)
 
 
 def default_num_workers():
@@ -172,14 +186,14 @@ def default_num_workers():
     return min(8, cores)
 
 
-def load_images(paths, resolution, cache_dir=DEFAULT_CACHE, num_workers=None, prefix="adni"):
+def load_images(paths, resolution, cache_dir=DEFAULT_CACHE, num_workers=None, prefix="adni", crop=None):
     """Load, preprocess, and stack images into a uint8 tensor of shape (N, 1, R, R).
 
-    Results are cached in cache_dir, keyed by the exact file list and resolution, so
+    Results are cached in cache_dir, keyed by the exact file list, crop, and resolution, so
     later runs load in seconds. Pass cache_dir=None to disable caching. Approximate
     cache sizes for ADNI: 125 MB at 64 px, 500 MB at 128 px, 2 GB at 256 px.
     """
-    key = hashlib.sha1(("\n".join(paths) + f"\n{resolution}").encode()).hexdigest()[:12]
+    key = hashlib.sha1(("\n".join(paths) + f"\n{resolution}\n{crop}").encode()).hexdigest()[:12]
     cache_path = os.path.join(cache_dir, f"{prefix}_{resolution}px_{key}.pt") if cache_dir else None
     if cache_path and os.path.exists(cache_path):
         images = torch.load(cache_path)
@@ -187,7 +201,7 @@ def load_images(paths, resolution, cache_dir=DEFAULT_CACHE, num_workers=None, pr
             return images
 
     workers = default_num_workers() if num_workers is None else num_workers
-    loader = DataLoader(_SliceFiles(paths, resolution), batch_size=256, num_workers=workers)
+    loader = DataLoader(_SliceFiles(paths, resolution, crop), batch_size=256, num_workers=workers)
     images = torch.cat(list(loader))
 
     if cache_path:
@@ -249,10 +263,10 @@ class ADNISlices(Dataset):
 
 
 def get_adni_splits(root=ADNI_ROOT, resolution=64, seed=DEFAULT_SEED, fractions=DEFAULT_FRACTIONS,
-                    cache_dir=DEFAULT_CACHE, num_workers=None):
+                    cache_dir=DEFAULT_CACHE, num_workers=None, crop=ADNI_CROP):
     """Return {'train', 'val', 'test'} -> ADNISlices with a leakage-free patient-level split."""
     records = index_adni(root)
-    images = load_images([r.path for r in records], resolution, cache_dir, num_workers, prefix="adni")
+    images = load_images([r.path for r in records], resolution, cache_dir, num_workers, prefix="adni", crop=crop)
     assignment = split_subjects(records, fractions, seed)
 
     splits = {}
@@ -331,6 +345,7 @@ def main():
     start = time.time()
     splits = get_adni_splits(args.root, args.resolution, args.seed, cache_dir=cache_dir,
                              num_workers=args.num_workers)
+    print(f"Brain crop (top, left, size): {ADNI_CROP}" + ("  (WARNING: cropping disabled)" if ADNI_CROP is None else ""))
     print(f"Loaded ADNI at {args.resolution}x{args.resolution} in {time.time() - start:.1f}s "
           f"(workers: {args.num_workers or default_num_workers()}, cache: {cache_dir})")
 

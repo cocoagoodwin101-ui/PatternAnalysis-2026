@@ -274,15 +274,17 @@ def fig_sample_slices(scans, out, rng):
     save(fig, out, "sample_slices.png")
 
 
-def fig_preprocessing(scans, out, rng):
-    """Original slice -> padded square -> downsampled working resolutions."""
+def fig_preprocessing(scans, out, rng, crop):
+    """Original slice -> padded square -> brain crop -> downsampled working resolutions."""
     ids = sorted(k for k, s in scans.items() if s["split"] == "train")
     s = scans[rng.choice(ids)]
     original = np.array(Image.open(s["paths"][10]))
     padded, top, left = pad_to_square(original)
-    stages = [("Original", original), ("Padded to square", padded)]
+    c_top, c_left, c_size = crop
+    cropped = padded[c_top:c_top + c_size, c_left:c_left + c_size]
+    stages = [("Original", original), ("Padded to square", padded), ("Cropped to brain region", cropped)]
     for res in (128, 64):
-        stages.append((f"Resized to {res}x{res}", np.array(Image.fromarray(padded).resize((res, res), Image.BILINEAR))))
+        stages.append((f"Resized to {res}x{res}", np.array(Image.fromarray(cropped).resize((res, res), Image.BILINEAR))))
 
     fig, axes = plt.subplots(1, len(stages), figsize=(3.2 * len(stages), 3.6))
     for ax, (title, img) in zip(axes, stages):
@@ -292,8 +294,93 @@ def fig_preprocessing(scans, out, rng):
         ax.set_yticks([])
     h, w = original.shape
     axes[1].add_patch(patches.Rectangle((left - 0.5, top - 0.5), w, h, fill=False, ls="--", ec="red", lw=1))
-    fig.suptitle("Preprocessing pipeline (dashed box = original extent)")
+    axes[1].add_patch(patches.Rectangle((c_left - 0.5, c_top - 0.5), c_size, c_size, fill=False, ec="yellow", lw=1))
+    fig.suptitle("Preprocessing pipeline (red dashed = original extent, yellow = brain crop)")
     save(fig, out, "preprocessing_pipeline.png")
+
+
+def measure_brain_extent(scans, threshold=10, min_pixels=3):
+    """Bounding box of brain tissue for every slice, in padded (square) coordinates.
+
+    A row or column counts as brain if at least `min_pixels` pixels exceed `threshold`,
+    which ignores isolated JPEG noise. Also accumulates how often each pixel is brain.
+
+    Returns (boxes, frequency, n_empty): boxes is an (N, 4) array of
+    [top, bottom, left, right] (inclusive), frequency is the fraction of slices in
+    which each pixel is brain, and n_empty counts slices with no brain pixels.
+    """
+    boxes, n_empty, freq = [], 0, None
+    for s in scans.values():
+        for path in s["paths"]:
+            mask = pad_to_square(np.array(Image.open(path)))[0] > threshold
+            freq = mask.astype(np.float64) if freq is None else freq + mask
+            rows = np.flatnonzero(mask.sum(axis=1) >= min_pixels)
+            cols = np.flatnonzero(mask.sum(axis=0) >= min_pixels)
+            if rows.size == 0 or cols.size == 0:
+                n_empty += 1
+                continue
+            boxes.append((rows[0], rows[-1], cols[0], cols[-1]))
+    return np.array(boxes), freq / sum(len(s["paths"]) for s in scans.values()), n_empty
+
+
+def compute_crop(boxes, image_size, margin=4):
+    """Smallest square containing every slice's brain box plus a margin, as (top, left, size).
+
+    The crop is fixed for the whole dataset so that brain size and position are not
+    altered per image. It is centred on the dataset-wide brain extent and clamped to
+    stay inside the image.
+    """
+    top, bottom = int(boxes[:, 0].min()), int(boxes[:, 1].max())
+    left, right = int(boxes[:, 2].min()), int(boxes[:, 3].max())
+    size = min(max(bottom - top + 1, right - left + 1) + 2 * margin, image_size)
+    c_top = int(round((top + bottom) / 2 - size / 2))
+    c_left = int(round((left + right) / 2 - size / 2))
+    c_top = min(max(c_top, 0), image_size - size)
+    c_left = min(max(c_left, 0), image_size - size)
+    return c_top, c_left, size
+
+
+def report_brain_extent(boxes, n_empty, crop, image_size):
+    """Print the brain extent, its robustness to outliers, and the crop to use."""
+    names = ["top", "bottom", "left", "right"]
+    print(f"Slices with no brain pixels: {n_empty}")
+    print(f"{'edge':<7} {'min':>5} {'0.1%':>6} {'median':>7} {'99.9%':>6} {'max':>5}")
+    for i, name in enumerate(names):
+        col = boxes[:, i]
+        print(f"{name:<7} {col.min():>5} {np.percentile(col, 0.1):>6.0f} {np.median(col):>7.0f} "
+              f"{np.percentile(col, 99.9):>6.0f} {col.max():>5}")
+    c_top, c_left, size = crop
+    heights = boxes[:, 1] - boxes[:, 0] + 1
+    widths = boxes[:, 3] - boxes[:, 2] + 1
+    print(f"Per-slice brain size (median): {np.median(heights):.0f} H x {np.median(widths):.0f} W px")
+    print(f"Crop (top, left, size) in padded {image_size}x{image_size} coordinates: {crop}")
+    print(f"Brain occupies {100 * np.median(np.maximum(heights, widths)) / image_size:.0f}% of the padded "
+          f"width before cropping and {100 * np.median(np.maximum(heights, widths)) / size:.0f}% after "
+          f"(median slice)")
+    outside = np.sum((boxes[:, 0] < c_top) | (boxes[:, 1] >= c_top + size) |
+                     (boxes[:, 2] < c_left) | (boxes[:, 3] >= c_left + size))
+    print(f"Slices with brain outside the crop: {outside}")
+    print(f"\n>>> Paste into dataset.py:  ADNI_CROP = ({c_top}, {c_left}, {size})")
+
+
+def fig_brain_extent(scans, freq, crop, out, rng):
+    """Brain-pixel frequency map and example slices with the crop square overlaid."""
+    c_top, c_left, size = crop
+    ids = sorted(scans)
+    examples = [scans[k]["paths"][i] for k, i in zip(rng.choice(ids, size=3, replace=False), (0, 10, 19))]
+    fig, axes = plt.subplots(1, 4, figsize=(14, 3.8))
+    im = axes[0].imshow(freq, cmap="magma", vmin=0, vmax=1)
+    fig.colorbar(im, ax=axes[0], fraction=0.046, label="Fraction of slices")
+    axes[0].set_title("Where brain tissue appears\n(all slices, padded coordinates)", fontsize=9)
+    for ax, path in zip(axes[1:], examples):
+        ax.imshow(pad_to_square(np.array(Image.open(path)))[0], cmap="gray", vmin=0, vmax=255)
+        ax.set_title("Example slice", fontsize=9)
+    for ax in axes:
+        ax.add_patch(patches.Rectangle((c_left - 0.5, c_top - 0.5), size, size, fill=False, ec="cyan", lw=1.2))
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(f"Fixed brain crop: {size}x{size} px at (top {c_top}, left {c_left})")
+    save(fig, out, "brain_extent.png")
 
 
 def fig_intensity(scans, out, rng, n_per_class):
@@ -337,14 +424,21 @@ def main():
     print("\n== Labels and subjects ==")
     check_labels_and_subjects(scans, subjects)
 
+    print("\n== Brain extent and crop ==")
+    boxes, freq, n_empty = measure_brain_extent(scans)
+    image_size = freq.shape[0]
+    crop = compute_crop(boxes, image_size)
+    report_brain_extent(boxes, n_empty, crop, image_size)
+
     print("\n== Figures ==")
     fig_provided_split_balance(scans, subjects, args.out)
     fig_provided_split_leakage(subjects, args.out)
     fig_scans_per_subject(subjects, args.out)
     fig_slice_windows(scans, args.out)
     fig_sample_slices(scans, args.out, rng)
-    fig_preprocessing(scans, args.out, rng)
+    fig_preprocessing(scans, args.out, rng, crop)
     fig_intensity(scans, args.out, rng, args.n_intensity)
+    fig_brain_extent(scans, freq, crop, args.out, rng)
 
 
 if __name__ == "__main__":
