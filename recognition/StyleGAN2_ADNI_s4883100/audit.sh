@@ -3,7 +3,6 @@
 #SBATCH --partition=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
 #SBATCH --time=00:15:00
 #SBATCH --output=audit_%j.out
 #SBATCH --error=audit_%j.err
