@@ -9,6 +9,8 @@ Pipeline (see README Section 5):
        (antialiased) to the working resolution.
     4. Preload all slices into memory as uint8 (optionally cached to disk) and scale to
        [-1, 1] per item.
+    5. Drop corrupted scans whose mean intensity is below half the median scan mean.
+       This happens after the patient split, so it never changes any patient's split.
 
 Smoke test (run on a Rangpur CPU node):
     python dataset.py --resolution 64
@@ -25,6 +27,7 @@ import json
 import os
 import random
 import re
+import statistics
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -39,10 +42,14 @@ ADNI_ROOT = "/home/groups/comp3710/ADNI"
 OASIS_GLOB = "/home/groups/comp3710/OASIS/keras_png_slices_train/*.png"  # confirm against your Lab 2 path
 DEFAULT_CACHE = os.path.expanduser("~/.cache/stylegan2_adni")
 
-# Fixed brain crop (top, left, size) in padded 256 x 256 coordinates, measured over all
-# 30,520 slices by data_audit.py. One crop for every image, so brain size and position
-# are never altered per image. Set to None to disable cropping.
-ADNI_CROP = None  # TODO: replace with the value printed by data_audit.py
+# Fixed brain crop (top, left, size) in padded 256 x 256 coordinates, or None.
+# Measured by data_audit.py: midline sagittal slices nearly fill the frame, so a crop
+# containing every brain is effectively the full image. Cropping is therefore disabled.
+ADNI_CROP = None
+
+# Scans whose mean intensity is below this fraction of the median scan mean are
+# excluded as corrupted (two scans in the current dataset; see data_audit.py).
+MIN_RELATIVE_SCAN_INTENSITY = 0.5
 DEFAULT_SEED = 42
 DEFAULT_FRACTIONS = (0.8, 0.1, 0.1)
 SPLITS = ("train", "val", "test")
@@ -212,6 +219,24 @@ def load_images(paths, resolution, cache_dir=DEFAULT_CACHE, num_workers=None, pr
     return images
 
 
+def find_dark_scans(records, images, min_relative=MIN_RELATIVE_SCAN_INTENSITY, chunk=2048):
+    """Return scan IDs whose mean intensity is below min_relative x the median scan mean.
+
+    Computed on the preloaded images in chunks (to bound memory at high resolution).
+    Padding and resizing scale every scan's mean by nearly the same factor, so this
+    relative rule gives the same result as the full-resolution check in data_audit.py.
+    """
+    slice_means = torch.cat([images[i:i + chunk].float().mean(dim=(1, 2, 3))
+                             for i in range(0, images.shape[0], chunk)]).tolist()
+    totals = defaultdict(lambda: [0.0, 0])
+    for r, m in zip(records, slice_means):
+        totals[r.scan_id][0] += m
+        totals[r.scan_id][1] += 1
+    scan_means = {scan: total / n for scan, (total, n) in totals.items()}
+    threshold = min_relative * statistics.median(scan_means.values())
+    return {scan for scan, m in scan_means.items() if m < threshold}
+
+
 # --------------------------------------------------------------------------- #
 # Datasets
 # --------------------------------------------------------------------------- #
@@ -226,10 +251,11 @@ class ADNISlices(Dataset):
     and slice_pos. The integer indices are local to this split.
     """
 
-    def __init__(self, records, images, transform=None):
+    def __init__(self, records, images, transform=None, excluded_scans=0, excluded_slices=0):
         if len(records) != images.shape[0]:
             raise ValueError("records and images must have the same length")
         self.records = records
+        self.excluded_scans, self.excluded_slices = excluded_scans, excluded_slices
         self.images = images  # uint8 (N, 1, R, R)
         self.transform = transform
 
@@ -263,16 +289,26 @@ class ADNISlices(Dataset):
 
 
 def get_adni_splits(root=ADNI_ROOT, resolution=64, seed=DEFAULT_SEED, fractions=DEFAULT_FRACTIONS,
-                    cache_dir=DEFAULT_CACHE, num_workers=None, crop=ADNI_CROP):
-    """Return {'train', 'val', 'test'} -> ADNISlices with a leakage-free patient-level split."""
+                    cache_dir=DEFAULT_CACHE, num_workers=None, crop=ADNI_CROP,
+                    min_relative_intensity=MIN_RELATIVE_SCAN_INTENSITY):
+    """Return {'train', 'val', 'test'} -> ADNISlices with a leakage-free patient-level split.
+
+    Patients are split first, using every scan, and corrupted (dark) scans are dropped
+    afterwards, so the exclusion never changes any patient's split assignment. Pass
+    min_relative_intensity=None to keep every scan.
+    """
     records = index_adni(root)
     images = load_images([r.path for r in records], resolution, cache_dir, num_workers, prefix="adni", crop=crop)
     assignment = split_subjects(records, fractions, seed)
+    excluded = set() if min_relative_intensity is None else find_dark_scans(records, images, min_relative_intensity)
 
     splits = {}
     for name in SPLITS:
-        idx = [i for i, r in enumerate(records) if assignment[r.subject_id] == name]
-        splits[name] = ADNISlices([records[i] for i in idx], images[idx])
+        in_split = [i for i, r in enumerate(records) if assignment[r.subject_id] == name]
+        keep = [i for i in in_split if records[i].scan_id not in excluded]
+        dropped = [records[i] for i in in_split if records[i].scan_id in excluded]
+        splits[name] = ADNISlices([records[i] for i in keep], images[keep],
+                                  excluded_scans=len({r.scan_id for r in dropped}), excluded_slices=len(dropped))
     return splits
 
 
@@ -350,6 +386,8 @@ def main():
           f"(workers: {args.num_workers or default_num_workers()}, cache: {cache_dir})")
 
     _check_no_leakage(splits)
+    print(f"Excluded dark scans (mean < {MIN_RELATIVE_SCAN_INTENSITY} x median scan mean): " +
+          ", ".join(f"{n}: {ds.excluded_scans} scans / {ds.excluded_slices} slices" for n, ds in splits.items()))
     _print_split_table(splits)
 
     train = splits["train"]
