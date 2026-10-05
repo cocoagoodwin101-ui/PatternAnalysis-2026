@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=audit-ladder
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=00:15:00
