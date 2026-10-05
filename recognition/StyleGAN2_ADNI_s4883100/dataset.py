@@ -381,7 +381,7 @@ def main():
     start = time.time()
     splits = get_adni_splits(args.root, args.resolution, args.seed, cache_dir=cache_dir,
                              num_workers=args.num_workers)
-    print(f"Brain crop (top, left, size): {ADNI_CROP}" + ("  (WARNING: cropping disabled)" if ADNI_CROP is None else ""))
+    print(f"Brain crop (top, left, size): {ADNI_CROP}" + ("  (no crop by design: see ADNI_CROP comment)" if ADNI_CROP is None else ""))
     print(f"Loaded ADNI at {args.resolution}x{args.resolution} in {time.time() - start:.1f}s "
           f"(workers: {args.num_workers or default_num_workers()}, cache: {cache_dir})")
 

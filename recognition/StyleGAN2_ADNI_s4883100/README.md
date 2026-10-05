@@ -80,10 +80,15 @@ The folders use **NC** (normal control); ADNI and the metadata use **CN** (cogni
 | Duplicates | None (no byte-identical files) |
 | Background | 74% of pixels are near-black (intensity < 10) in both classes |
 | File naming | `<scanID>_<sliceIndex>.jpeg`, where `scanID` is the ADNI image ID |
+| View | Sagittal, skull-stripped (cerebellum, corpus callosum, and lateral ventricle visible) |
+| Brain size | Median 167 H × 146 W px within the padded 256 × 256 frame; midline slices nearly fill the frame |
+| Data quality | 2 corrupted scans (40 slices) excluded; 3 scans whose brains touch the top edge are kept (Discoveries 11–12) |
 
 ![Example slices](figures/sample_slices.png)
 
 ![Slice windows](figures/slice_windows.png)
+
+![Brain extent](figures/brain_extent.png)
 
 ### 3.5 Metadata JSON
 
@@ -137,6 +142,9 @@ No patient changes diagnosis between visits: every patient is either CN-only or 
 | 7 | Slice windows differ between scans | Each scan has 20 contiguous slices, but window start positions vary across scans | The same slice index shows different anatomy in different scans | Memorisation comparisons use nearest-neighbour search over slices rather than matched indices |
 | 8 | Background dominates every image | 74% of pixels are near-black (< 10) in both classes | Pixel metrics such as SSIM are inflated by shared black background, making any two brains look similar | Evaluate whether SSIM should be computed within a brain mask (Section 7) |
 | 9 | Slice windows are **class-dependent** | AD windows start at a median slice index of 78; CN windows at 88 | Class is confounded with anatomical level: a class-conditional model could learn "which part of the brain" rather than disease-related anatomy, and CN vs AD comparisons partly compare different brain regions | Compare classes at matched slice positions where possible, and account for the offset when interpreting conditional generation and per-class metrics |
+| 10 | The brain already fills most of the frame | Median brain box 167 H × 146 W px in the padded 256 × 256 image; between the 0.1th and 99.9th percentiles, brain boxes span rows 8–228 and columns 14–239 | A fixed crop (which must contain every brain, so that brain size and position are not altered per image) would be the full frame and gain no resolution | No crop: padding only (`ADNI_CROP = None`) |
+| 11 | Two scans are corrupted | Per-scan mean intensity of 0.9 and 7.8, against a median of 29.2 and a 1st percentile of 21.2. With contrast stretched, one is blocky noise; the other mixes a non-skull-stripped head with pure-noise slices. The first also accounts for all 3 empty slices and the only left-edge contact | A GAN would learn near-black or noise images as valid brains | Exclude scans with mean intensity < 0.5 × the median scan mean (14.6), applied after the patient split so no split assignment changes. Removes 2 scans (40 slices) belonging to 2 CN training patients with no other scans |
+| 12 | Three scans' brains touch the top edge | 45 slices from 3 scans reach original row 0 | Visual inspection shows complete, anatomically normal brains positioned high in the frame | Kept |
 
 No byte-identical duplicate images exist across the 30,520 files.
 
@@ -144,18 +152,24 @@ No byte-identical duplicate images exist across the 30,520 files.
 
 ![Intensity histogram](figures/intensity_histogram.png)
 
+![Per-scan mean intensity](figures/scan_mean_intensity.png)
+
+![Flagged scans](figures/flagged_scans.png)
+
 ---
 
 ## 5. Preprocessing and Data Splits
 
 ### 5.1 Preprocessing pipeline
 
-1. **Index:** scan the folders and record each slice's scan ID, slice index, and class. Attach the patient ID from the metadata JSON at runtime.
-2. **Split:** assign every patient to train, validation, or test (Section 5.2). All slices of all scans from a patient inherit that patient's split.
-3. **Pad:** zero-pad each 240 × 256 slice to 256 × 256 (8 rows top and bottom). Zero matches the existing background and preserves the anatomy's aspect ratio, which resizing directly would distort.
-4. **Resize:** downsample with antialiasing to the working resolution: 64 × 64 during development, then 128 × 128 and 256 × 256.
-5. **Scale:** map intensities from [0, 255] to [−1, 1], matching the generator's `tanh` output range.
-6. **Preload:** hold all slices in memory as `uint8` and convert to float per batch. At 128 × 128 the full dataset is about 500 MB.
+1. **Index:** record each slice's scan ID, slice index, position within its 20-slice window, and class. Attach the patient ID from the metadata JSON at runtime.
+2. **Split:** assign every patient to train, validation, or test using all scans (Section 5.2). All slices of a patient's scans inherit that patient's split.
+3. **Exclude corrupted scans:** drop scans whose mean intensity is below 0.5 × the median scan mean (Discovery 11). This happens after splitting, so it never changes any patient's split assignment.
+4. **Pad:** zero-pad each 240 × 256 slice to 256 × 256 (8 rows top and bottom). Zero matches the existing background and preserves the anatomy's aspect ratio, which resizing directly would distort.
+5. **No crop:** a fixed crop containing every brain would be the full frame (Discovery 10).
+6. **Resize:** downsample with antialiasing to the working resolution: 64 × 64 during development, then 128 × 128 and 256 × 256.
+7. **Scale:** map intensities from [0, 255] to [−1, 1], matching the generator's `tanh` output range.
+8. **Preload:** hold all slices in memory as `uint8` and convert to float per batch, with an on-disk cache outside the repository. At 64 × 64 the training split occupies 100 MB, and the first load takes about 20 s with 8 workers.
 
 Data augmentation is not yet decided. It will be introduced with adaptive discriminator augmentation (ADA) in a later iteration.
 
@@ -179,9 +193,12 @@ Resulting split (seed 42), verified by the `dataset.py` smoke test, which also a
 
 | Split | Patients (CN / AD) | Scans (CN / AD) | Slices (CN / AD) | AD share of slices |
 |---|---:|---:|---:|---:|
-| train | 367 / 177 | 624 / 604 | 12,480 / 12,080 | 49.2% |
+| train | 365 / 177 | 622 / 604 | 12,440 / 12,080 | 49.3% |
 | val | 46 / 22 | 72 / 71 | 1,440 / 1,420 | 49.7% |
 | test | 46 / 22 | 87 / 68 | 1,740 / 1,360 | 43.9% |
+| **Total** | **678** | **1,524** | **30,480** | |
+
+Both excluded scans (Discovery 11) belonged to CN patients in the training split who had no other scans, so train holds 365 CN patients rather than the 367 assigned. Validation and test are unaffected.
 
 Stratification balances patients, not slices. Because AD patients have between 1 and 8 scans each, the slice-level class balance varies between splits (the test split has fewer AD scans), so all evaluation metrics are reported per class rather than pooled.
 
@@ -199,6 +216,8 @@ Stratification balances patients, not slices. Because AD patients have between 1
 | Privacy | No patient IDs or split files committed | ADNI data use terms |
 | Memorisation audit | Three-level distance ladder with per-class thresholds | A threshold calibrated on real data instead of an arbitrary cutoff (Section 7) |
 | Code organisation | `modules.py`, `dataset.py`, `train.py`, `predict.py`, plus `audit.py` and `data_audit.py` | Required structure; model code depends only on PyTorch |
+| Brain crop | None (padding only) | Measured: a crop containing every brain is the full frame (Discovery 10) |
+| Scan quality filter | Exclude scans with mean intensity < 0.5 × median, after the patient split | Removes the two corrupted scans with a relative rule rather than hard-coded IDs, without altering the split (Discovery 11) |
 
 ---
 
@@ -234,7 +253,7 @@ An arbitrary similarity cutoff cannot answer this. Instead, the threshold is cal
 All statistics and figures in Sections 3 and 4 come from `data_audit.py`. On Rangpur:
 
 ```bash
-srun --partition=cpu --time=00:20:00 --pty bash
+srun --partition=cpu --time=00:45:00 --pty bash
 conda activate torch
 python data_audit.py            # prints statistics, writes figures/ next to the script
 exit
@@ -279,7 +298,11 @@ This disclosure follows the UQ Library *Guide to acknowledging and referencing A
 | 28/09/2026 | Claude Opus 5.5 | **Drafted:** this disclosure table, following UQ Library guidance located via web search | "can you add an AI usage referencing table to the readme in accordance with uq guidelines?? include the date - 28/09/2026" | Section 12 | Checked the required fields against the UQ Library guide linked below |
 | 28/09/2026 | Claude Opus 5.5 | **Edited:** changed the AI reference in 12.4 to UQ's general APA format with the tool's web address, and added it to the reference list | "yes add the tool's web address to those references" | Sections 12.4 and 13 | Checked the format against the APA 7th "General AI references" example in the UQ Library guide |
 | 28/09/2026 | Claude Opus 5.5 | **Planned:** ordered the next stages (data pipeline → threshold calibration → WGAN-GP baseline → feasibility review → StyleGAN2) | "ok all done, git is up to date. Where to next?" | Project plan; Section 2 (feasibility review) | Checked the plan against the feasibility check-off requirements in Section 3 of the report specification |
-| 28/09/2026 | Claude Opus 5.5 | **Generated code:** wrote `dataset.py` (slice indexing, patient-level stratified split, padding/resizing, cached preloading, OASIS verification loader, smoke test) | "yes" (in response to the proposal to write `dataset.py` with the index, patient-level split, and preloading) | `dataset.py`; Sections 5.1 and 5.2 | Indexing and split logic were tested on synthetic data (correct 544/68/68 patient split, deterministic across runs). Ran the smoke test on Rangpur: the leakage assertion passed, the split table matched the designed patient counts (544/68/68), and the real-image grids in `figures/dataset_batch_check.png` and `figures/oasis_batch_check.png` showed correctly preprocessed brain slices
+| 28/09/2026 | Claude Opus 5.5 | **Generated code:** wrote `dataset.py` (slice indexing, patient-level stratified split, padding/resizing, cached preloading, OASIS verification loader, smoke test) | "yes" (in response to the proposal to write `dataset.py` with the index, patient-level split, and preloading) | `dataset.py`; Sections 5.1 and 5.2 | Indexing and split logic were tested on synthetic data (correct 544/68/68 patient split, deterministic across runs). Ran the smoke test on Rangpur: the leakage assertion passed, the split table matched the designed patient counts (544/68/68), and the real-image grids in `figures/dataset_batch_check.png` and `figures/oasis_batch_check.png` showed correctly preprocessed brain slices |
+| 05/10/2026 | Claude Opus 5.5 | **Generated code / analysed:** proposed cropping to the brain region and wrote the brain-extent measurement and crop support in `data_audit.py` and `dataset.py` | "yes" (in response to the proposal to crop to the brain region) | `data_audit.py`; `dataset.py` (`ADNI_CROP`); Discovery 10 | Ran the measurement on Rangpur. Claude's visual estimate of brain size from the batch grid (about 40% of the frame) was wrong; the measurement showed about 65% and a full-frame crop, so I rejected cropping based on the evidence |
+| 05/10/2026 | Claude Opus 5.5 | **Generated code:** one-off diagnostic scripts to locate outlier slices, per-scan intensity, edge-touching scans, and the second-darkest scan, plus `scp` commands to retrieve figures | Requests to run and retrieve the diagnostics (e.g. "give me the scp cmds") | Discoveries 11–12 | Inspected every diagnostic figure myself: two scans are corrupted, three edge-touching scans are anatomically normal |
+| 05/10/2026 | Claude Opus 5.5 | **Generated code:** relative-intensity exclusion rule applied after the patient split in `dataset.py`; folded the diagnostics into `data_audit.py` | Continuation of the outlier investigation, after I uploaded the figures and output | `dataset.py`; `data_audit.py`; Section 5.1 | Full audit on Rangpur flagged exactly the 2 corrupted scans; smoke test passed the leakage check, removed 2 scans (40 slices) from train only, and left val and test unchanged |
+| 05/10/2026 | Claude Opus 5.5 | **Drafted:** README updates for Discoveries 10–12 and Sections 3.4, 5.1, 5.2, 6, and 8 | Pasting the audit and smoke-test output | README Sections 3–6, 8 | Checked every number against the Rangpur output |
 
 ### 12.3 Verification approach
 
