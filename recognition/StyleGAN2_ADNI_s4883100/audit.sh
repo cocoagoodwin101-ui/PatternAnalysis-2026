@@ -16,7 +16,7 @@
 echo "Job $SLURM_JOB_ID on $(hostname), started $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-source "$HOME/miniconda3/bin/activate"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate torch
 
 cd "$SLURM_SUBMIT_DIR"
