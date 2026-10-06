@@ -1,24 +1,36 @@
-"""Memorisation audit, part 1: calibrate the distance ladder on real ADNI data only.
+"""Memorisation audit, part 1: calibrate the similarity ladder on real ADNI data only.
 
-Design: README Section 7. Every rung is a nearest-neighbour similarity, measured with
-SSIM (higher = more similar), both over the whole image and over the brain only:
+Design: README Section 7. Every rung is a nearest-neighbour similarity measured with
+SSIM (higher = more similar), over the whole image and over the brain only. Rungs:
 
-    near-duplicate    adjacent slices of the same scan (training split)
-    same person       each slice of one visit -> nearest slice in any OTHER visit of the
-                      same patient (training patients with 2+ scans)
-    different person  each held-out test slice -> nearest slice in the whole training split
+    Copy references (what memorising a training image looks like):
+      near-duplicate   adjacent slices of the same training scan
+      same session     training slice -> nearest slice of another scan of the same patient
+                       acquired on the same day (repeat acquisition)
+    Identity reference (reported, not used for the threshold):
+      different day    training slice -> nearest slice of the same patient's scans from
+                       other days (same brain, different head position)
+    Strangers (genuinely new brains):
+      stranger val     validation slice -> nearest training slice   [calibrates threshold]
+      stranger test    test slice -> nearest training slice         [checks false flags]
 
-The memorisation threshold for each class is a high percentile (default 95th) of the
-same-person similarities, i.e. "closer than 95% of genuine repeat visits of one brain".
-Part 2 will compare generated slices against the same training split and threshold.
+Threshold: per class and metric, a high percentile (default 99th) of the validation
+stranger similarities. A generated slice above it is closer to a training slice than
+almost any real new brain gets, and is inspected as a possible copy. The test strangers
+estimate the false-flag rate on data not used for calibration; the copy references show
+whether the threshold catches copies.
 
-The key diagnostic printed at the end is the false-flag rate: the share of real,
-genuinely new test brains that already exceed the threshold. If it is high, that metric
-cannot tell "same brain" from "any brain" and must not be used to judge memorisation.
+Why not "same person" as the threshold: the first calibration run (README Section 7)
+showed that same-day repeat scans are near-identical (SSIM ~0.99), while visits on
+different days are not aligned to each other, so pixel SSIM cannot recognise a patient
+across visits. The same-person threshold was therefore ~1.0 and would pass most copies.
+
+Also printed: a visit-pair table categorising every pair of scans of the same patient by
+series ID and acquisition date (parsed from the metadata 'raw' path).
 
 Usage (GPU job on Rangpur, see audit.sh):
-    python audit.py --resolution 64 --max_test_queries 500   # quick first run
-    python audit.py --resolution 64                           # full run
+    python audit.py --resolution 64 --max_queries 500   # quick run
+    python audit.py --resolution 64                     # full run
 
 Outputs: raw per-slice similarities and thresholds in outputs/audit/ (gitignored; contains
 local split indices only, no patient IDs) and a histogram figure in figures/.
@@ -30,8 +42,8 @@ import os
 import re
 import statistics
 import time
-from datetime import date
 from collections import defaultdict
+from datetime import date
 
 import torch
 import torch.nn.functional as F
@@ -168,33 +180,6 @@ def near_duplicate(train, index):
     return dict(whole=whole.cpu(), masked=masked.cpu(), labels=train.labels[a.cpu()])
 
 
-def same_person(train, index):
-    """Each slice of a multi-visit patient -> nearest slice in any other visit of that patient.
-
-    Taking the nearest over all other visits mirrors the generated-sample audit, which
-    searches every training slice (including every visit of every patient).
-    """
-    by_subject = defaultdict(list)
-    for i, s in enumerate(train.subject_idx.tolist()):
-        by_subject[s].append(i)
-
-    whole, masked, query, n_patients = [], [], [], defaultdict(int)
-    for slices in by_subject.values():
-        scans = train.scan_idx[slices]
-        if len(scans.unique()) < 2:
-            continue
-        n_patients[int(train.labels[slices[0]])] += 1
-        idx = torch.tensor(slices, device=index.device)
-        w, m = index.pairwise(idx, idx)
-        same_scan = (scans[:, None] == scans[None, :]).to(index.device)
-        whole.append(w.masked_fill(same_scan, -2.0).max(dim=1).values.cpu())
-        masked.append(m.masked_fill(same_scan, -2.0).max(dim=1).values.cpu())
-        query.extend(slices)
-    query = torch.tensor(query)
-    return dict(whole=torch.cat(whole), masked=torch.cat(masked), labels=train.labels[query],
-                subject_idx=train.subject_idx[query], n_patients=dict(n_patients))
-
-
 # --------------------------------------------------------------------------- #
 # Visit-pair diagnostic
 # --------------------------------------------------------------------------- #
@@ -215,6 +200,17 @@ def load_sessions(records, root=ADNI_ROOT):
         d = m.group(1) if m else None
         sessions[scan] = (date(int(d[:4]), int(d[4:6]), int(d[6:])), m.group(2)) if m else None
     return sessions
+
+
+def pair_category(ses_a, ses_b):
+    """Categorise two scans of one patient: (category, days apart or None)."""
+    if ses_a is None or ses_b is None:
+        return "unparsed", None
+    if ses_a[1] == ses_b[1]:
+        return "same series", 0
+    if ses_a[0] == ses_b[0]:
+        return "same day", 0
+    return "different day", abs((ses_a[0] - ses_b[0]).days)
 
 
 def visit_pairs(train, index, sessions):
@@ -246,16 +242,8 @@ def visit_pairs(train, index, sessions):
                 cols = (scans == b).nonzero().flatten()
                 best, arg = m[rows][:, cols].max(dim=1)
                 ia, ib = members[rows], members[cols[arg]]
-                ses_a = sessions.get(train.records[int(ia[0])].scan_id)
-                ses_b = sessions.get(train.records[int(members[cols[0]])].scan_id)
-                if ses_a is None or ses_b is None:
-                    category, gap = "unparsed", None
-                elif ses_a[1] == ses_b[1]:
-                    category, gap = "same series", 0
-                elif ses_a[0] == ses_b[0]:
-                    category, gap = "same day", 0
-                else:
-                    category, gap = "different day", abs((ses_a[0] - ses_b[0]).days)
+                category, gap = pair_category(sessions.get(train.records[int(ia[0])].scan_id),
+                                              sessions.get(train.records[int(members[cols[0]])].scan_id))
                 win_a = set(slice_index[members[rows]].tolist())
                 win_b = set(slice_index[members[cols]].tolist())
                 pairs.append(dict(
@@ -274,7 +262,7 @@ def summarise_pairs(pairs):
         return next(name for lo, hi, name in GAP_BINS if lo <= p["gap_days"] < hi)
 
     order = ["same series", "same day"] + [name for _, _, name in GAP_BINS] + ["unparsed"]
-    print(f"\nVisit pairs of training patients (pair SSIM = median over A's slices of best masked SSIM in B)")
+    print("\nVisit pairs of training patients (pair SSIM = median over A's slices of best masked SSIM in B)")
     print(f"{'pair type':<14} {'class':<5} {'pairs':>6} {'SSIM p50':>9} {'SSIM>0.99':>9} "
           f"{'|offset| p50':>12} {'overlap p50':>11}")
     for g in order:
@@ -289,26 +277,67 @@ def summarise_pairs(pairs):
                   f"{statistics.median(p['overlap'] for p in sel):>11.0f}")
 
 
-def different_person(train, test, train_index, test_index, max_queries=None, seed=DEFAULT_SEED):
-    """Each held-out test slice -> nearest slice in the whole training split.
+def same_patient(train, index, sessions):
+    """Same-session and different-day rungs for training patients with 2+ scans.
 
-    Test and train images live in separate SSIMIndex objects, so a small adapter
-    concatenates them into one index for the search.
+    For each slice, the nearest slice among the patient's other scans in each category:
+    'same session' covers scans from the same day (including the same series reprocessed),
+    'different day' covers scans acquired on another day. A slice contributes to a rung
+    only if its patient has at least one scan in that category. Scans whose date does not
+    parse are left out of both.
     """
-    q = torch.arange(len(test))
-    if max_queries is not None and max_queries < len(test):
-        q = torch.randperm(len(test), generator=torch.Generator().manual_seed(seed))[:max_queries].sort().values
+    to_rung = {"same series": "same_session", "same day": "same_session", "different day": "different_day"}
+    by_subject = defaultdict(list)
+    for i, s in enumerate(train.subject_idx.tolist()):
+        by_subject[s].append(i)
 
-    joint = _join(train_index, test_index)
-    offset = train_index.n
+    out = {name: dict(whole=[], masked=[], query=[]) for name in ("same_session", "different_day")}
+    for slices in by_subject.values():
+        scans = train.scan_idx[slices].tolist()
+        if len(set(scans)) < 2:
+            continue
+        ses = {s: sessions.get(train.records[i].scan_id) for s, i in zip(scans, slices)}
+        rung_of = {(a, b): to_rung.get(pair_category(ses[a], ses[b])[0])
+                   for a in ses for b in ses if a != b}
+        members = torch.tensor(slices, device=index.device)
+        w, m = index.pairwise(members, members)
+        for name in out:
+            allowed = torch.tensor([[rung_of.get((a, b)) == name for b in scans] for a in scans],
+                                   device=index.device)
+            rows = allowed.any(dim=1)
+            if not rows.any():
+                continue
+            out[name]["whole"].append(w.masked_fill(~allowed, -2.0).max(dim=1).values[rows].cpu())
+            out[name]["masked"].append(m.masked_fill(~allowed, -2.0).max(dim=1).values[rows].cpu())
+            out[name]["query"].append(torch.tensor(slices)[rows.cpu()])
+
+    rungs = {}
+    for name, r in out.items():
+        query = torch.cat(r["query"]) if r["query"] else torch.zeros(0, dtype=torch.long)
+        rungs[name] = dict(whole=torch.cat(r["whole"]) if r["whole"] else torch.zeros(0),
+                           masked=torch.cat(r["masked"]) if r["masked"] else torch.zeros(0),
+                           labels=train.labels[query], subject_idx=train.subject_idx[query])
+    return rungs
+
+
+def stranger(train, queries, train_index, query_index, max_queries=None, seed=DEFAULT_SEED):
+    """Each query slice (validation or test split) -> nearest slice in the whole training split.
+
+    Patients are split at patient level, so every query is a genuinely new brain.
+    """
+    q = torch.arange(len(queries))
+    if max_queries is not None and max_queries < len(queries):
+        q = torch.randperm(len(queries), generator=torch.Generator().manual_seed(seed))[:max_queries].sort().values
+
+    joint = _join(train_index, query_index)
     cand = torch.arange(train_index.n, device=joint.device)
     start = time.time()
-    res = joint.nearest(q.to(joint.device) + offset, cand)
+    res = joint.nearest(q.to(joint.device) + train_index.n, cand)
     if joint.device.type == "cuda":
         torch.cuda.synchronize()
-    elapsed = time.time() - start
-    res.update(labels=test.labels[q], nn_label_whole=train.labels[res["whole_arg"]],
-               nn_label_masked=train.labels[res["masked_arg"]], seconds=elapsed, n_queries=len(q))
+    res.update(labels=queries.labels[q], nn_label_whole=train.labels[res["whole_arg"]],
+               nn_label_masked=train.labels[res["masked_arg"]], seconds=time.time() - start,
+               n_queries=len(q))
     return res
 
 
@@ -325,57 +354,78 @@ def _join(a, b):
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
+RUNG_ORDER = ("near_duplicate", "same_session", "different_day", "stranger_val", "stranger_test")
+RUNG_ROLE = {"near_duplicate": "copy", "same_session": "copy", "different_day": "identity",
+             "stranger_val": "calibration", "stranger_test": "false flags"}
+
+
 def percentiles(v, ps=(5, 50, 95)):
     v = v.float()
     return [float(torch.quantile(v, p / 100)) for p in ps] if len(v) else [float("nan")] * len(ps)
 
 
-def summarise(rungs, threshold_pct):
-    """Print the ladder table, compute per-class thresholds and the false-flag rate."""
-    print(f"\n{'rung':<17} {'class':<5} {'metric':<7} {'n':>7} {'p5':>7} {'p50':>7} {'p95':>7}")
-    for name, r in rungs.items():
+def calibrate(rungs, threshold_pct):
+    """Per-class, per-metric threshold: the given percentile of validation-stranger SSIM."""
+    val = rungs["stranger_val"]
+    return {cls: {metric: float(torch.quantile(val[metric][val["labels"] == label].float(), threshold_pct / 100))
+                  for metric in ("whole", "masked")}
+            for label, cls in enumerate(CLASS_NAMES)}
+
+
+def summarise(rungs, thresholds, threshold_pct):
+    """Print every rung with the share of its slices at or above the class threshold.
+
+    For copy rungs that share is the detection rate (should be high); for test strangers
+    it is the false-flag rate (should be near 100 - threshold_pct); for different-day
+    pairs it shows whether the metric recognises the same patient across visits.
+    """
+    print(f"\nThreshold = {threshold_pct:g}th percentile of validation-stranger SSIM, per class and metric.")
+    print(f"{'rung':<15} {'role':<12} {'class':<5} {'metric':<7} {'n':>6} {'p5':>7} {'p50':>7} {'p95':>7} "
+          f"{'>= thr':>7}")
+    for name in RUNG_ORDER:
+        r = rungs[name]
         for label, cls in enumerate(CLASS_NAMES):
             sel = r["labels"] == label
             for metric in ("whole", "masked"):
-                p5, p50, p95 = percentiles(r[metric][sel])
-                print(f"{name:<17} {cls:<5} {metric:<7} {int(sel.sum()):>7} {p5:>7.4f} {p50:>7.4f} {p95:>7.4f}")
+                v = r[metric][sel]
+                p5, p50, p95 = percentiles(v)
+                share = float((v >= thresholds[cls][metric]).float().mean()) if len(v) else float("nan")
+                print(f"{name:<15} {RUNG_ROLE[name]:<12} {cls:<5} {metric:<7} {len(v):>6} "
+                      f"{p5:>7.4f} {p50:>7.4f} {p95:>7.4f} {share:>7.1%}")
 
-    thresholds, sp, dp = {}, rungs["same_person"], rungs["different_person"]
-    print(f"\nMemorisation threshold = {threshold_pct}th percentile of same-person SSIM, per class.")
-    print("False-flag rate = share of real held-out test slices (new brains) at or above it.")
-    print(f"{'class':<5} {'metric':<7} {'threshold':>9} {'false-flag':>10} {'NN same class':>13}")
+    print(f"\n{'class':<5} {'metric':<7} {'threshold':>9}  test: nearest training slice has same class")
+    test = rungs["stranger_test"]
     for label, cls in enumerate(CLASS_NAMES):
-        thresholds[cls] = {}
+        sel = test["labels"] == label
         for metric in ("whole", "masked"):
-            t = float(torch.quantile(sp[metric][sp["labels"] == label].float(), threshold_pct / 100))
-            sel = dp["labels"] == label
-            flag = float((dp[metric][sel] >= t).float().mean())
-            same_cls = float((dp[f"nn_label_{metric}"][sel] == label).float().mean())
-            thresholds[cls][metric] = t
-            print(f"{cls:<5} {metric:<7} {t:>9.4f} {flag:>10.1%} {same_cls:>13.1%}")
-    return thresholds
+            same = float((test[f"nn_label_{metric}"][sel] == label).float().mean())
+            print(f"{cls:<5} {metric:<7} {thresholds[cls][metric]:>9.4f}  {same:.1%}")
 
 
-def plot_ladder(rungs, thresholds, path, resolution):
+def plot_ladder(rungs, thresholds, path, resolution, threshold_pct):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colours = {"near_duplicate": "#8172B2", "same_person": "#C44E52", "different_person": "#4C72B0"}
+    colours = {"near_duplicate": "#8172B2", "same_session": "#C44E52", "different_day": "#DD8452",
+               "stranger_val": "#4C72B0", "stranger_test": "#55A868"}
     fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharey="row")
     for row, cls in enumerate(CLASS_NAMES):
         for col, metric in enumerate(("whole", "masked")):
             ax = axes[row, col]
-            for name, r in rungs.items():
+            for name in RUNG_ORDER:
+                r = rungs[name]
                 v = r[metric][r["labels"] == row].numpy()
-                ax.hist(v, bins=60, range=(0, 1), density=True, alpha=0.55, color=colours[name],
-                        label=name.replace("_", " "))
-            ax.axvline(thresholds[cls][metric], color="k", ls="--", lw=1, label="threshold")
+                if len(v):
+                    ax.hist(v, bins=80, range=(0, 1), density=True, histtype="step", lw=1.5,
+                            color=colours[name], label=f"{name.replace('_', ' ')} ({RUNG_ROLE[name]})")
+            ax.axvline(thresholds[cls][metric], color="k", ls="--", lw=1,
+                       label=f"threshold (val p{threshold_pct:g})")
             ax.set_title(f"{cls}, {metric}-image SSIM ({resolution} px)")
             ax.set_xlabel("nearest-neighbour SSIM (higher = more similar)")
             if col == 0:
                 ax.set_ylabel("density")
-    axes[0, 0].legend(loc="upper left", fontsize=8)
+    axes[0, 0].legend(loc="upper left", fontsize=7)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -383,12 +433,12 @@ def plot_ladder(rungs, thresholds, path, resolution):
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    p = argparse.ArgumentParser(description="Calibrate the memorisation-audit distance ladder on real ADNI data.")
+    p = argparse.ArgumentParser(description="Calibrate the memorisation-audit similarity ladder on real ADNI data.")
     p.add_argument("--resolution", type=int, default=64,
                    help="must match the resolution the generator will be audited at")
-    p.add_argument("--max_test_queries", type=int, default=None,
-                   help="subsample test queries for the different-person rung (quick runs)")
-    p.add_argument("--threshold_pct", type=float, default=95.0)
+    p.add_argument("--max_queries", type=int, default=None,
+                   help="subsample validation and test queries for the stranger rungs (quick runs)")
+    p.add_argument("--threshold_pct", type=float, default=99.0)
     p.add_argument("--brain_threshold", type=int, default=BRAIN_THRESHOLD)
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--cache_dir", default=DEFAULT_CACHE)
@@ -402,49 +452,52 @@ def main():
 
     splits = get_adni_splits(resolution=args.resolution, seed=args.seed, cache_dir=args.cache_dir,
                              num_workers=args.num_workers)
-    train, test = splits["train"], splits["test"]
-    train_index = SSIMIndex(train.images, device, args.brain_threshold)
-    test_index = SSIMIndex(test.images, device, args.brain_threshold)
-    print(f"Train {len(train)} slices, test {len(test)} slices at {args.resolution} px")
+    train, val, test = splits["train"], splits["val"], splits["test"]
+    index = {name: SSIMIndex(ds.images, device, args.brain_threshold) for name, ds in splits.items()}
+    print(f"Slices at {args.resolution} px: train {len(train)}, val {len(val)}, test {len(test)}")
 
     rungs = {}
     t0 = time.time()
-    rungs["near_duplicate"] = near_duplicate(train, train_index)
+    rungs["near_duplicate"] = near_duplicate(train, index["train"])
     print(f"near-duplicate: {len(rungs['near_duplicate']['whole'])} adjacent pairs ({time.time() - t0:.1f}s)")
-
-    t0 = time.time()
-    rungs["same_person"] = same_person(train, train_index)
-    print(f"same person: {len(rungs['same_person']['whole'])} query slices from patients "
-          f"{ {CLASS_NAMES[k]: v for k, v in rungs['same_person']['n_patients'].items()} } "
-          f"({time.time() - t0:.1f}s)")
 
     sessions = load_sessions(train.records)
     n_bad = sum(v is None for v in sessions.values())
     print(f"Parsed acquisition date and series for {len(sessions) - n_bad}/{len(sessions)} training scans")
-    pairs = visit_pairs(train, train_index, sessions)
+    t0 = time.time()
+    rungs.update(same_patient(train, index["train"], sessions))
+    for name in ("same_session", "different_day"):
+        r = rungs[name]
+        print(f"{name.replace('_', ' ')}: {len(r['whole'])} query slices from "
+              f"{len(r['subject_idx'].unique())} patients")
+    pairs = visit_pairs(train, index["train"], sessions)
+    print(f"Same-patient rungs and visit pairs: {time.time() - t0:.1f}s")
     summarise_pairs(pairs)
 
-    rungs["different_person"] = different_person(train, test, train_index, test_index,
-                                                 args.max_test_queries, args.seed)
-    dp = rungs["different_person"]
-    rate = dp["n_queries"] / dp["seconds"]
-    print(f"different person: {dp['n_queries']} test queries x {len(train)} train slices in "
-          f"{dp['seconds']:.1f}s ({rate:.1f} queries/s; all {len(test)} would take ~{len(test) / rate / 60:.1f} min)")
+    for name, split in (("stranger_val", "val"), ("stranger_test", "test")):
+        r = stranger(train, splits[split], index["train"], index[split], args.max_queries, args.seed)
+        rungs[name] = r
+        print(f"{name.replace('_', ' ')}: {r['n_queries']} queries x {len(train)} train slices in "
+              f"{r['seconds']:.1f}s ({r['n_queries'] / r['seconds']:.1f} queries/s)")
     if device.type == "cuda":
         print(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
-    thresholds = summarise(rungs, args.threshold_pct)
+    thresholds = calibrate(rungs, args.threshold_pct)
+    summarise(rungs, thresholds, args.threshold_pct)
 
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.fig_dir, exist_ok=True)
     tag = f"r{args.resolution}"
-    torch.save(dict(rungs=rungs, visit_pairs=pairs), os.path.join(args.out_dir, f"ladder_{tag}.pt"))
+    torch.save(dict(rungs=rungs, visit_pairs=pairs, thresholds=thresholds),
+               os.path.join(args.out_dir, f"ladder_{tag}.pt"))
     with open(os.path.join(args.out_dir, f"thresholds_{tag}.json"), "w") as f:
         json.dump(dict(resolution=args.resolution, percentile=args.threshold_pct,
-                       brain_threshold=args.brain_threshold, seed=args.seed,
-                       test_queries=dp["n_queries"], thresholds=thresholds), f, indent=2)
+                       calibrated_on="validation strangers", brain_threshold=args.brain_threshold,
+                       seed=args.seed, queries=dict(val=rungs["stranger_val"]["n_queries"],
+                                                    test=rungs["stranger_test"]["n_queries"]),
+                       thresholds=thresholds), f, indent=2)
     fig_path = os.path.join(args.fig_dir, f"audit_ladder_{tag}.png")
-    plot_ladder(rungs, thresholds, fig_path, args.resolution)
+    plot_ladder(rungs, thresholds, fig_path, args.resolution, args.threshold_pct)
     print(f"\nSaved {args.out_dir}/ladder_{tag}.pt, thresholds_{tag}.json and {fig_path}")
 
 
