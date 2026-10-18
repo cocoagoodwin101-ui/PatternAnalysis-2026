@@ -10,6 +10,14 @@ threshold: the same percentile of validation-stranger SSIM, over both classes. I
 flag rate on real test patients (also pooled) is the reference a non-memorising generator
 should match. Flag rates are reported with 95% Wilson intervals.
 
+Two checks separate memorisation from reduced diversity when the flag rate is high:
+  - neighbour concentration: how many distinct training slices (and patients) are the
+    nearest neighbours of the generated set, against the same count for real test
+    patients. Flagged samples that keep landing on a few training slices or patients point
+    to memorisation; flags spread over many point to concentration on typical slices.
+  - copy level: how many generated slices reach the near-duplicate rung's 5th percentile,
+    i.e. are as close to a training slice as an adjacent slice of the same scan.
+
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
     python predict.py --run_name wgan_adni64 --snapshots all    # flag rate across training
@@ -111,6 +119,47 @@ def summarise(res, ref, n):
                            nn_ssim_p5_p50_p95=[float(torch.quantile(v.float(), p)) for p in (0.05, 0.5, 0.95)],
                            threshold=ref[metric]["threshold"], test_flag_rate=ref[metric]["test_flag_rate"])
     return out
+
+
+def concentration(nn_idx, flagged, subject_idx):
+    """How concentrated a query set's nearest training neighbours are, overall and among flags."""
+    nn_idx, flagged = nn_idx.cpu(), flagged.cpu()
+    counts = torch.bincount(nn_idx)
+    f_idx = nn_idx[flagged]
+    f_counts = torch.bincount(f_idx) if len(f_idx) else torch.zeros(1, dtype=torch.long)
+    return dict(queries=len(nn_idx), distinct_nn=int((counts > 0).sum()), max_repeat=int(counts.max()),
+                flagged=int(flagged.sum()), flagged_distinct_nn=int((f_counts > 0).sum()) if len(f_idx) else 0,
+                flagged_distinct_patients=int(subject_idx[f_idx].unique().numel()) if len(f_idx) else 0,
+                flagged_max_repeat=int(f_counts.max()) if len(f_idx) else 0)
+
+
+def memorisation_checks(res, ladder, ref, subject_idx):
+    """Neighbour concentration (generated and test strangers) and copy-level counts, per metric."""
+    rungs = ladder["rungs"]
+    out = {}
+    for metric in ("whole", "masked"):
+        t = ref[metric]["threshold"]
+        copy_level = float(torch.quantile(rungs["near_duplicate"][metric].float(), 0.05))
+        test = rungs["stranger_test"]
+        out[metric] = dict(
+            generated=concentration(res[f"{metric}_arg"], res[metric] >= t, subject_idx),
+            test_strangers=concentration(test[f"{metric}_arg"], test[metric] >= t, subject_idx),
+            copy_level=copy_level, copy_level_count=int((res[metric] >= copy_level).sum()),
+            max_nn_ssim=float(res[metric].max()))
+    return out
+
+
+def print_checks(it, checks):
+    for metric in ("whole", "masked"):
+        c = checks[metric]
+        for name in ("generated", "test_strangers"):
+            g = c[name]
+            label = f"{it:>6}" if name == "generated" else f"{'':>6}"
+            print(f"{label} {metric:<7} {name.replace('_', ' '):<15} {g['queries']:>5} {g['distinct_nn']:>9} "
+                  f"{g['max_repeat']:>7} {g['flagged']:>8} {g['flagged_distinct_nn']:>10} "
+                  f"{g['flagged_distinct_patients']:>9} {g['flagged_max_repeat']:>8}")
+        print(f"{'':>6} {metric:<7} copy level (near-duplicate p5 = {c['copy_level']:.4f}): "
+              f"{c['copy_level_count']} generated slices at or above; max generated NN SSIM {c['max_nn_ssim']:.4f}")
 
 
 # --------------------------------------------------------------------------- #
@@ -215,14 +264,24 @@ def main():
         t0 = time.time()
         res = audit_generated(gen, train_index, device, calib["brain_threshold"])
         s = summarise(res, ref, args.n_samples)
-        results[it] = dict(s, search_seconds=round(time.time() - t0, 1))
+        checks = memorisation_checks(res, ladder, ref, train.subject_idx)
+        results[it] = dict(s, checks=checks, search_seconds=round(time.time() - t0, 1))
         for metric in ("whole", "masked"):
             r = s[metric]
             print(f"{it:>6} {metric:<7} {r['flagged']:>8} {r['flag_rate']:>7.2%} "
                   f"[{r['ci95'][0]:6.2%}, {r['ci95'][1]:6.2%}] "
                   + " ".join(f"{q:>7.4f}" for q in r["nn_ssim_p5_p50_p95"]))
 
+    print("\nNeighbour concentration (same number of queries; NN = nearest training slice)")
+    print(f"{'iter':>6} {'metric':<7} {'query set':<15} {'n':>5} {'distinct':>9} {'max rep':>7} "
+          f"{'flagged':>8} {'flag dist':>10} {'flag pat':>9} {'flag rep':>8}")
+    for it_k, r in results.items():
+        print_checks(it_k, r["checks"])
+
     test = ladder["rungs"]["stranger_test"]
+    if args.n_samples != len(test["masked"]):
+        print(f"Note: {args.n_samples} generated vs {len(test['masked'])} test queries; distinct-neighbour "
+              f"counts are only comparable at equal numbers of queries")
     print("\nFor comparison, real test patients' nearest-training SSIM (p5 / p50 / p95):")
     for metric in ("whole", "masked"):
         q = [float(torch.quantile(test[metric].float(), p)) for p in (0.05, 0.5, 0.95)]
