@@ -17,6 +17,17 @@ Two checks separate memorisation from reduced diversity when the flag rate is hi
     to memorisation; flags spread over many point to concentration on typical slices.
   - copy level: how many generated slices reach the near-duplicate rung's 5th percentile,
     i.e. are as close to a training slice as an adjacent slice of the same scan.
+The neighbour-concentration comparison is confounded: test queries come in runs of 20
+adjacent slices per scan, so they share neighbours more than independent samples do.
+
+Matched-reference test (after Meehan et al., 2020, "A non-parametric test to detect data-
+copying in generative models"): is each generated slice closer to the training patients
+than to equally many unseen patients? References are the validation split and several
+random subsets of training patients with the same number of patients per class and the
+same number of slices. If the generator fits features specific to its training patients,
+generated slices are closer to the training subsets; if it only produces typical slices,
+they are equally close to both. Real test slices are run through the same comparison as a
+control, since they are unseen by both references and should show no preference.
 
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
@@ -162,6 +173,58 @@ def print_checks(it, checks):
               f"{c['copy_level_count']} generated slices at or above; max generated NN SSIM {c['max_nn_ssim']:.4f}")
 
 
+def matched_subsets(train, val, k, seed):
+    """k random sets of training slices matched to the validation split.
+
+    Each set has the validation split's number of patients per class; if those patients
+    have more slices than the validation split, slices are subsampled to the same count.
+    """
+    n_val = len(val)
+    per_class = {lab: int(val.subject_idx[val.labels == lab].unique().numel()) for lab in (0, 1)}
+    g = torch.Generator().manual_seed(seed)
+    subsets = []
+    for _ in range(k):
+        picks = []
+        for lab, n in per_class.items():
+            patients = train.subject_idx[train.labels == lab].unique()
+            picks.append(patients[torch.randperm(len(patients), generator=g)[:n]])
+        idx = torch.isin(train.subject_idx, torch.cat(picks)).nonzero().flatten()
+        if len(idx) > n_val:
+            idx = idx[torch.randperm(len(idx), generator=g)[:n_val]].sort().values
+        subsets.append(idx)
+    return subsets
+
+
+def reference_gap(joint, queries, subsets, val_cand):
+    """Nearest-neighbour SSIM of each query to the validation split and to each training subset.
+
+    Returns per metric: median similarity to the validation split and (averaged over
+    subsets) to the training subsets, the mean paired difference (training minus
+    validation), and the share of queries closer to the training subset, each with its
+    range over subsets.
+    """
+    device = joint.device
+    to_val = joint.nearest(queries, val_cand)
+    to_train = [joint.nearest(queries, c.to(device)) for c in subsets]
+    out = {}
+    for metric in ("whole", "masked"):
+        v = to_val[metric]
+        diffs = [t[metric] - v for t in to_train]
+        mean_diff = [float(d.mean()) for d in diffs]
+        closer = [float((d > 0).float().mean()) for d in diffs]
+        out[metric] = dict(val_p50=float(v.median()),
+                           train_p50=sum(float(t[metric].median()) for t in to_train) / len(to_train),
+                           diff_mean=sum(mean_diff) / len(mean_diff), diff_range=[min(mean_diff), max(mean_diff)],
+                           closer_to_train=sum(closer) / len(closer), closer_range=[min(closer), max(closer)])
+    return out
+
+
+def print_gap(label, metric, g):
+    print(f"{label:>14} {metric:<7} {g['train_p50']:>9.4f} {g['val_p50']:>9.4f} "
+          f"{g['diff_mean']:>+9.4f} [{g['diff_range'][0]:+.4f}, {g['diff_range'][1]:+.4f}] "
+          f"{g['closer_to_train']:>7.1%} [{g['closer_range'][0]:.1%}, {g['closer_range'][1]:.1%}]")
+
+
 # --------------------------------------------------------------------------- #
 # Figures
 # --------------------------------------------------------------------------- #
@@ -228,6 +291,8 @@ def main():
     p.add_argument("--snapshots", choices=["last", "all"], default="last")
     p.add_argument("--n_samples", type=int, default=3100, help="default matches the number of test-stranger slices")
     p.add_argument("--seed", type=int, default=0, help="latent sampling seed")
+    p.add_argument("--ref_subsets", type=int, default=5,
+                   help="random training-patient subsets for the matched-reference test")
     p.add_argument("--audit_dir", default=os.path.join(here, "outputs", "audit"))
     p.add_argument("--cache_dir", default=DEFAULT_CACHE)
     p.add_argument("--num_workers", type=int, default=None)
@@ -248,9 +313,21 @@ def main():
     print(f"Real test patients flagged at these thresholds: whole {ref['whole']['test_flag_rate']:.2%}, "
           f"masked {ref['masked']['test_flag_rate']:.2%}")
 
-    train = get_adni_splits(resolution=config["resolution"], seed=calib["seed"], cache_dir=args.cache_dir,
-                            num_workers=args.num_workers)["train"]
+    splits = get_adni_splits(resolution=config["resolution"], seed=calib["seed"], cache_dir=args.cache_dir,
+                             num_workers=args.num_workers)
+    train, val, test_split = splits["train"], splits["val"], splits["test"]
     train_index = SSIMIndex(train.images, device, calib["brain_threshold"])
+
+    # Matched-reference test: references are the validation split (appended after the
+    # training slices in one joint index) and random training subsets matched to it.
+    refs = _join(train_index, SSIMIndex(val.images, device, calib["brain_threshold"]))
+    val_cand = torch.arange(train_index.n, refs.n, device=device)
+    subsets = matched_subsets(train, val, args.ref_subsets, calib["seed"])
+    print(f"Matched references: validation {len(val)} slices; {args.ref_subsets} training subsets of "
+          f"{min(len(c) for c in subsets)}-{max(len(c) for c in subsets)} slices from the same patient numbers")
+    joint = _join(refs, SSIMIndex(test_split.images, device, calib["brain_threshold"]))
+    test_gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
+    del joint
 
     chosen = snaps if args.snapshots == "all" else snaps[-1:]
     generator = build_generator(config, device)
@@ -265,12 +342,27 @@ def main():
         res = audit_generated(gen, train_index, device, calib["brain_threshold"])
         s = summarise(res, ref, args.n_samples)
         checks = memorisation_checks(res, ladder, ref, train.subject_idx)
-        results[it] = dict(s, checks=checks, search_seconds=round(time.time() - t0, 1))
+        joint = _join(refs, SSIMIndex(gen, device, calib["brain_threshold"]))
+        gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
+        del joint
+        results[it] = dict(s, checks=checks, matched_reference=gap, search_seconds=round(time.time() - t0, 1))
         for metric in ("whole", "masked"):
             r = s[metric]
             print(f"{it:>6} {metric:<7} {r['flagged']:>8} {r['flag_rate']:>7.2%} "
                   f"[{r['ci95'][0]:6.2%}, {r['ci95'][1]:6.2%}] "
                   + " ".join(f"{q:>7.4f}" for q in r["nn_ssim_p5_p50_p95"]))
+
+    print("\nMatched-reference test: nearest SSIM to training subsets vs to the validation split "
+          "(equal patients and slices)")
+    print(f"{'query set':>14} {'metric':<7} {'to train':>9} {'to val':>9} {'mean diff':>9} {'range':>17} "
+          f"{'closer':>7} {'range':>15}")
+    for metric in ("whole", "masked"):
+        print_gap("real test", metric, test_gap[metric])
+    for it_k, r in results.items():
+        for metric in ("whole", "masked"):
+            print_gap(f"gen {it_k}", metric, r["matched_reference"][metric])
+    print("(to train / to val = median nearest SSIM; mean diff = mean per-slice difference, train minus val; "
+          "closer = share of slices closer to the training subset; ranges over subsets)")
 
     print("\nNeighbour concentration (same number of queries; NN = nearest training slice)")
     print(f"{'iter':>6} {'metric':<7} {'query set':<15} {'n':>5} {'distinct':>9} {'max rep':>7} "
@@ -292,7 +384,8 @@ def main():
     os.makedirs(args.fig_dir, exist_ok=True)
     with open(os.path.join(out_dir, f"memorisation_{tag}.json"), "w") as f:
         json.dump(dict(run=args.run_name, n_samples=args.n_samples, seed=args.seed,
-                       percentile=calib["percentile"], reference=ref, snapshots=results), f, indent=2)
+                       percentile=calib["percentile"], reference=ref, matched_reference_test_control=test_gap,
+                       snapshots=results), f, indent=2)
     title = f"{args.run_name}, iteration {it}, {args.n_samples} samples"
     plot_distributions(res, ladder, ref, os.path.join(args.fig_dir, f"{args.run_name}_audit.png"), title)
     plot_nearest(gen, train.images, res, os.path.join(args.fig_dir, f"{args.run_name}_nearest.png"), title,
