@@ -29,6 +29,13 @@ generated slices are closer to the training subsets; if it only produces typical
 they are equally close to both. Real test slices are run through the same comparison as a
 control, since they are unseen by both references and should show no preference.
 
+The reported excess is generated minus control, paired by subset (both use the same
+references). Its 95% interval comes from a bootstrap that resamples test patients (their
+slices are correlated, so patients, not slices, are the independent units) and generated
+samples (independent draws), after averaging each query's difference over the subsets.
+The single validation split is not resampled; pairing removes its shared bias but not
+all of its sampling variability.
+
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
     python predict.py --run_name wgan_adni64 --snapshots all    # flag rate across training
@@ -215,8 +222,41 @@ def reference_gap(joint, queries, subsets, val_cand):
         out[metric] = dict(val_p50=float(v.median()),
                            train_p50=sum(float(t[metric].median()) for t in to_train) / len(to_train),
                            diff_mean=sum(mean_diff) / len(mean_diff), diff_range=[min(mean_diff), max(mean_diff)],
-                           closer_to_train=sum(closer) / len(closer), closer_range=[min(closer), max(closer)])
+                           closer_to_train=sum(closer) / len(closer), closer_range=[min(closer), max(closer)],
+                           diff_per_subset=mean_diff, closer_per_subset=closer,
+                           per_query=torch.stack(diffs, dim=1).cpu())  # (queries, subsets); not saved
     return out
+
+
+def paired_excess(gen_gap, ctrl_gap, ctrl_groups, n_boot=2000, seed=0):
+    """Generated minus control difference, per subset and with a patient-level bootstrap interval."""
+    g = torch.Generator().manual_seed(seed)
+    groups = ctrl_groups.cpu()
+    patients, inverse = groups.unique(return_inverse=True)
+    out = {}
+    for metric in ("whole", "masked"):
+        gq = gen_gap[metric]["per_query"].double()
+        cq = ctrl_gap[metric]["per_query"].double()
+        per_subset = (gq.mean(0) - cq.mean(0)).tolist()
+        gq, cq = gq.mean(1), cq.mean(1)  # average each query over the subsets
+        # Control: resample patients with replacement, weighting by their slices.
+        p_sum = torch.zeros(len(patients), dtype=torch.float64).index_add_(0, inverse, cq)
+        p_cnt = torch.zeros(len(patients), dtype=torch.float64).index_add_(0, inverse, torch.ones_like(cq))
+        pick = torch.randint(len(patients), (n_boot, len(patients)), generator=g)
+        ctrl_b = p_sum[pick].sum(1) / p_cnt[pick].sum(1)
+        # Generated: independent samples, resampled directly.
+        gen_b = gq[torch.randint(len(gq), (n_boot, len(gq)), generator=g)].mean(1)
+        boot = gen_b - ctrl_b
+        out[metric] = dict(excess=float(gq.mean() - cq.mean()),
+                           ci95=[float(torch.quantile(boot, 0.025)), float(torch.quantile(boot, 0.975))],
+                           share_boot_le_0=float((boot <= 0).double().mean()),
+                           per_subset=per_subset, subsets_positive=int(sum(x > 0 for x in per_subset)),
+                           control_ci95=[float(torch.quantile(ctrl_b, 0.025)), float(torch.quantile(ctrl_b, 0.975))])
+    return out
+
+
+def strip_per_query(gap):
+    return {m: {k: v for k, v in d.items() if k != "per_query"} for m, d in gap.items()}
 
 
 def print_gap(label, metric, g):
@@ -345,7 +385,9 @@ def main():
         joint = _join(refs, SSIMIndex(gen, device, calib["brain_threshold"]))
         gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
         del joint
-        results[it] = dict(s, checks=checks, matched_reference=gap, search_seconds=round(time.time() - t0, 1))
+        excess = paired_excess(gap, test_gap, test_split.subject_idx, seed=args.seed)
+        results[it] = dict(s, checks=checks, matched_reference=strip_per_query(gap), paired_excess=excess,
+                           search_seconds=round(time.time() - t0, 1))
         for metric in ("whole", "masked"):
             r = s[metric]
             print(f"{it:>6} {metric:<7} {r['flagged']:>8} {r['flag_rate']:>7.2%} "
@@ -363,6 +405,22 @@ def main():
             print_gap(f"gen {it_k}", metric, r["matched_reference"][metric])
     print("(to train / to val = median nearest SSIM; mean diff = mean per-slice difference, train minus val; "
           "closer = share of slices closer to the training subset; ranges over subsets)")
+
+    first = next(iter(results.values()))["paired_excess"]
+    print("\nPaired excess over the real-test control (generated mean diff minus control mean diff)")
+    for metric in ("whole", "masked"):
+        lo, hi = first[metric]["control_ci95"]
+        print(f"  control {metric:<7} mean diff {test_gap[metric]['diff_mean']:+.4f}, "
+              f"95% CI over test patients [{lo:+.4f}, {hi:+.4f}]")
+    print(f"{'iter':>6} {'metric':<7} {'excess':>8} {'95% CI':>19} {'P(<=0)':>7} "
+          f"{'per-subset range':>19} {'positive':>8}")
+    for it_k, r in results.items():
+        for metric in ("whole", "masked"):
+            e = r["paired_excess"][metric]
+            print(f"{it_k:>6} {metric:<7} {e['excess']:>+8.4f} [{e['ci95'][0]:+.4f}, {e['ci95'][1]:+.4f}] "
+                  f"{e['share_boot_le_0']:>7.3f} [{min(e['per_subset']):+.4f}, {max(e['per_subset']):+.4f}] "
+                  f"{e['subsets_positive']:>4}/{len(e['per_subset'])}")
+    print("(P(<=0) = share of bootstrap replicates with no excess; positive = subsets where generated exceeds control)")
 
     print("\nNeighbour concentration (same number of queries; NN = nearest training slice)")
     print(f"{'iter':>6} {'metric':<7} {'query set':<15} {'n':>5} {'distinct':>9} {'max rep':>7} "
@@ -384,7 +442,7 @@ def main():
     os.makedirs(args.fig_dir, exist_ok=True)
     with open(os.path.join(out_dir, f"memorisation_{tag}.json"), "w") as f:
         json.dump(dict(run=args.run_name, n_samples=args.n_samples, seed=args.seed,
-                       percentile=calib["percentile"], reference=ref, matched_reference_test_control=test_gap,
+                       percentile=calib["percentile"], reference=ref, matched_reference_test_control=strip_per_query(test_gap),
                        snapshots=results), f, indent=2)
     title = f"{args.run_name}, iteration {it}, {args.n_samples} samples"
     plot_distributions(res, ladder, ref, os.path.join(args.fig_dir, f"{args.run_name}_audit.png"), title)
