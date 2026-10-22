@@ -30,7 +30,32 @@ Medical imaging research is constrained by patient privacy law and limited scan 
 
 ## 2. Feasibility Review
 
-*To be completed before the midpoint check-off.*
+*Presented at the midpoint check-off on 27/10/2026.*
+
+**Aim.** To find out whether StyleGAN2 generates more realistic ADNI brain slices than a WGAN-GP baseline without moving closer to its training patients, so a project manager can decide whether the synthetic cohort is safe to share.
+
+**User need, scope and acceptance criteria.** An imaging research team wants to share a synthetic cohort of cognitively normal and Alzheimer's disease brain slices without breaching patient confidentiality. Scope: StyleGAN2 generating 64 × 64 sagittal slices (128 × 128 if the budget allows), plus an audit of whether its output is realistic, novel and safe to share.
+
+1. **Fidelity:** lower FID against held-out test slices than the baseline at the same resolution; median nearest-neighbour SSIM to real slices above 0.6.
+2. **No copies:** none of 3,100 generated slices reaches copy level (Section 7).
+3. **Memorisation:** at the selected checkpoint, a flag rate and matched-reference excess no higher than the baseline's at equal or better FID.
+4. **Coverage:** a t-SNE or UMAP embedding shows generated slices across both classes and the range of slice positions.
+5. **Resources:** one A100 (40 GB), resumable jobs of 12 hours or less, at most 24 GPU-hours per configuration (an estimate; measured in the first run).
+
+**Model choice and course concepts.** StyleGAN2 [Hard difficulty] on ADNI (`/home/groups/comp3710/ADNI`), unconditional first. It extends the course's GAN material (adversarial training, convolutional generators and discriminators, regularisation). A mapping network turns the latent vector into a style vector that modulates every synthesis layer, giving fine texture and a latent space that can be analysed with PCA and interpolation (Karras et al., 2019, 2020). R1 and path-length regularisation stabilise training, and adaptive discriminator augmentation targets small datasets; with 542 training patients, overfitting is the central risk. Liu, Chandra et al. (2023) apply style-based models to neuroimaging. The baseline is my Lab 2 WGAN-GP (Gulrajani et al., 2017), sharing the same data pipeline and evaluation.
+
+**Plan.** (1) FID for every baseline snapshot, giving a fidelity-versus-memorisation curve. (2) A minimal StyleGAN2, verified on OASIS 64 px. (3) StyleGAN2 on ADNI 64 px, measuring memory and time. (4) Add augmentation, then diagnosis conditioning, auditing every snapshot. (5) Embeddings, a failure autopsy and the final recommendation.
+
+**Preliminary feasibility evidence.**
+
+| Evidence | Result |
+|---|---|
+| Data audit and split | The provided split leaks 216 of 680 patients; re-split 80/10/10 by patient (542 / 68 / 68) |
+| Memorisation audit | Thresholds from validation patients flag 0.3–0.9% of unseen test patients and at least 99.2% of near-duplicates |
+| Baseline | Reproduces Lab 2 on OASIS; on ADNI 64 px, 15,100 iterations in 25 min using 0.43 GB |
+| Baseline audit | No copies; flag rate rises from 0.03% to 4.2% over training |
+
+**Risks, budget and fallback.** Instability or mode collapse: watched through loss curves, sample grids and per-snapshot audits, and mitigated by R1 and augmentation. Compute: measured at 64 px before scaling. Memorisation: checkpoints chosen on the fidelity-versus-memorisation curve. Class confound: slice windows differ by class (Discovery 9), so the model is unconditional first. The audit barely recognises a patient across visits, so a feature-space check is added. Budget: about 30 A100-hours (an estimate). Fallback: StyleGAN2 at 64 px with a reduced network, which keeps the Hard tier; the comparison and audit stand either way.
 
 ---
 
@@ -378,3 +403,5 @@ Guidance followed: The University of Queensland Library. *Guide to acknowledging
 - Alzheimer's Disease Neuroimaging Initiative (ADNI), http://adni.loni.usc.edu
 - Anthropic. (2026). *Claude* [Large language model]. https://claude.ai
 - Z. Wang, A. C. Bovik, H. R. Sheikh, and E. P. Simoncelli, "Image quality assessment: from error visibility to structural similarity," IEEE Transactions on Image Processing, vol. 13, no. 4, pp. 600–612, 2004.
+- I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, and A. Courville, "Improved training of Wasserstein GANs," in Proc. NeurIPS, 2017.
+- T. Karras, M. Aittala, J. Hellsten, S. Laine, J. Lehtinen, and T. Aila, "Training generative adversarial networks with limited data," in Proc. NeurIPS, 2020.
