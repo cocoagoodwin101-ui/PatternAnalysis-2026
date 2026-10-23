@@ -1,9 +1,10 @@
 """Train a generative model on ADNI (or OASIS, for verification) and log everything needed
 to compare models: losses, sample grids, time per iteration, and peak GPU memory.
 
-Currently supports the WGAN-GP baseline (modules.WGANGenerator / WGANCritic, ported from my
-Lab 2 model). StyleGAN2 will be added as another --model choice sharing the same data,
-logging and checkpointing, so both models are trained and measured the same way.
+Two models share the same data, logging, snapshots and checkpointing, so both are trained
+and measured the same way:
+  --model wgan-gp    the baseline (modules.WGANGenerator / WGANCritic, ported from Lab 2)
+  --model stylegan2  modules.StyleGAN2Generator / StyleGAN2Discriminator
 
 Training length is set in generator iterations, not epochs, because ADNI's training split
 (24,520 slices) is 2.5x larger than OASIS (9,664): the Lab 2 run's 100 OASIS epochs equal
@@ -15,10 +16,22 @@ iteration reuse the same real batch with fresh fake batches; Gulrajani et al. (2
 draw a new real batch for every critic step. Kept as is so the port reproduces the
 known-good Lab 2 behaviour.
 
+StyleGAN2 training follows Karras et al. (2020) and the small-data settings of Karras et
+al. (2020b, ADA paper): Adam lr 0.0025, betas (0, 0.99); one discriminator and one
+generator step per iteration with the non-saturating logistic loss; R1 regularisation on
+real images applied lazily every 16 steps (scaled by 16, with the optimiser corrected
+for the interval), gamma = 0.0002 * resolution^2 / batch size unless --r1_gamma is set;
+and an exponential moving average (EMA) of the generator, with a half-life of
+10 * batch / 32 thousand images, which is used for all samples, snapshots and
+evaluation. Not yet included: style-mixing and path-length regularisation, and adaptive
+augmentation. One iteration shows the discriminator one real batch, so thousands of
+real images seen (kimg) = iterations * batch size / 1000, the same count as for WGAN-GP.
+
 Usage (GPU job on Rangpur, see train.sh):
     python train.py --dataset oasis --iters 200 --run_name smoke       # quick check
     python train.py --dataset oasis --run_name wgan_oasis64            # reproduce Lab 2
     python train.py --dataset adni --run_name wgan_adni64              # baseline on ADNI
+    python train.py --model stylegan2 --dataset oasis --iters 200 --run_name sg2_smoke
 
 Outputs go to outputs/runs/<run_name>/ (gitignored): config.json, history.json,
 summary.json, loss_curves.png, samples/iter_XXXXXX.png (fixed noise), snapshots/
@@ -27,6 +40,7 @@ summary.json, loss_curves.png, samples/iter_XXXXXX.png (fixed noise), snapshots/
 """
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -36,7 +50,8 @@ import torch.optim as optim
 from torchvision.utils import save_image
 
 from dataset import DEFAULT_CACHE, DEFAULT_SEED, OASISSlices, get_adni_splits
-from modules import WGANCritic, WGANGenerator, count_parameters, gradient_penalty
+from modules import (StyleGAN2Discriminator, StyleGAN2Generator, WGANCritic, WGANGenerator, count_parameters,
+                     d_logistic_loss, g_nonsaturating_loss, gradient_penalty, r1_penalty)
 
 
 # --------------------------------------------------------------------------- #
@@ -84,22 +99,28 @@ def save_samples(generator, z, path):
     generator.train(was_training)
 
 
-def plot_history(history, path):
+WGAN_PANELS = [("WGAN-GP losses", [("critic_loss", "critic loss"), ("gen_loss", "generator loss")]),
+               ("Wasserstein estimate  E[D(real)] - E[D(fake)]", [("w_est", None)]),
+               ("Gradient penalty", [("gp", None)])]
+STYLEGAN_PANELS = [("StyleGAN2 losses", [("d_loss", "discriminator loss"), ("g_loss", "generator loss")]),
+                   ("Discriminator scores", [("real_score", "D(real)"), ("fake_score", "D(fake)")]),
+                   ("R1 penalty  ||grad D(real)||^2", [("r1", None)])]
+
+
+def plot_history(history, path, panels):
+    """One panel per (title, [(history key, legend label)]) entry, against generator iteration."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     it = history["iter"]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(it, history["critic_loss"], label="critic loss")
-    axes[0].plot(it, history["gen_loss"], label="generator loss")
-    axes[0].set_title("WGAN-GP losses")
-    axes[0].legend()
-    axes[1].plot(it, history["w_est"], color="green")
-    axes[1].set_title("Wasserstein estimate  E[D(real)] - E[D(fake)]")
-    axes[2].plot(it, history["gp"], color="purple")
-    axes[2].set_title("Gradient penalty")
-    for ax in axes:
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
+    for ax, (title, series) in zip(axes, panels):
+        for key, label in series:
+            ax.plot(it, history[key], label=label)
+        if any(label for _, label in series):
+            ax.legend()
+        ax.set_title(title)
         ax.set_xlabel("generator iteration")
         ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -184,7 +205,7 @@ def train_wgan_gp(args, batches, device, run_dir):
                             g_opt=g_opt.state_dict(), c_opt=c_opt.state_dict(), fixed_z=fixed_z.cpu(),
                             history=history, iter=it, epoch=batches.epoch,
                             batch_rng=batches.gen.get_state()), ckpt_path)
-            plot_history(history, os.path.join(run_dir, "loss_curves.png"))
+            plot_history(history, os.path.join(run_dir, "loss_curves.png"), WGAN_PANELS)
             with open(os.path.join(run_dir, "history.json"), "w") as f:
                 json.dump(history, f)
 
@@ -194,19 +215,146 @@ def train_wgan_gp(args, batches, device, run_dir):
     return dict(generator_params=count_parameters(generator), critic_params=count_parameters(critic))
 
 
+def stylegan2_settings(args):
+    """R1 weight and EMA decay per iteration, from the ADA paper's heuristics unless overridden."""
+    gamma = args.r1_gamma if args.r1_gamma is not None else 0.0002 * args.resolution ** 2 / args.batch_size
+    ema_kimg = args.batch_size * 10 / 32
+    ema_beta = 0.5 ** (args.batch_size / (ema_kimg * 1000))
+    return gamma, ema_beta
+
+
+def train_stylegan2(args, batches, device, run_dir):
+    G = StyleGAN2Generator(args.resolution, z_dim=args.latent_dim, channel_base=args.channel_base,
+                           max_channels=args.max_channels).to(device)
+    D = StyleGAN2Discriminator(args.resolution, channel_base=args.channel_base,
+                               max_channels=args.max_channels).to(device)
+    G_ema = copy.deepcopy(G).eval().requires_grad_(False)
+    gamma, ema_beta = stylegan2_settings(args)
+    # Lazy regularisation: the R1 step runs every r1_every iterations, so the optimiser's
+    # learning rate and betas are adjusted as in the StyleGAN2 paper (Appendix B).
+    c = args.r1_every / (args.r1_every + 1)
+    g_opt = optim.Adam(G.parameters(), lr=args.lr, betas=(0.0, 0.99))
+    d_opt = optim.Adam(D.parameters(), lr=args.lr * c, betas=(0.0, 0.99 ** c))
+    fixed_z = torch.randn(64, args.latent_dim, device=device,
+                          generator=torch.Generator(device=device).manual_seed(args.seed))
+
+    keys = ("iter", "epoch", "kimg", "d_loss", "g_loss", "real_score", "fake_score", "r1", "sec_per_iter")
+    history = {k: [] for k in keys}
+    start_iter, ckpt_path = 0, os.path.join(run_dir, "checkpoint.pt")
+    if args.resume and os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        for module, key in ((G, "generator"), (D, "discriminator"), (G_ema, "generator_ema"),
+                            (g_opt, "g_opt"), (d_opt, "d_opt")):
+            module.load_state_dict(ckpt[key])
+        fixed_z, history, start_iter = ckpt["fixed_z"].to(device), ckpt["history"], ckpt["iter"]
+        batches.gen.set_state(ckpt["batch_rng"].cpu())
+        batches.epoch = ckpt["epoch"]
+        print(f"Resumed from iteration {start_iter}")
+    print(f"Generator {count_parameters(G):,} parameters (mapping {count_parameters(G.mapping):,}), "
+          f"discriminator {count_parameters(D):,}")
+    print(f"R1 gamma {gamma:.4g} every {args.r1_every} iterations; EMA beta {ema_beta:.6f} per iteration")
+
+    acc = dict(d_loss=0.0, g_loss=0.0, real_score=0.0, fake_score=0.0, n=0)
+    last_r1 = float("nan")
+    t_log = time.time()
+    for it in range(start_iter + 1, args.iters + 1):
+        real = batches.next()
+
+        # Discriminator step: logistic loss on a real and a generated batch.
+        z = torch.randn(real.size(0), args.latent_dim, device=device)
+        with torch.no_grad():
+            fake = G(z)
+        real_scores, fake_scores = D(real), D(fake)
+        d_loss = d_logistic_loss(real_scores, fake_scores)
+        d_opt.zero_grad(set_to_none=True)
+        d_loss.backward()
+        d_opt.step()
+
+        # Lazy R1 on real images, scaled by the interval so its average weight is gamma / 2.
+        if it % args.r1_every == 0:
+            r1 = r1_penalty(D, real)
+            d_opt.zero_grad(set_to_none=True)
+            (gamma / 2 * r1 * args.r1_every).backward()
+            d_opt.step()
+            last_r1 = r1.item()
+
+        # Generator step: non-saturating loss; also updates the running average of w.
+        z = torch.randn(real.size(0), args.latent_dim, device=device)
+        g_loss = g_nonsaturating_loss(D(G(z, track_w_avg=True)))
+        g_opt.zero_grad(set_to_none=True)
+        g_loss.backward()
+        g_opt.step()
+
+        # Exponential moving average of the generator weights (buffers such as w_avg copied).
+        with torch.no_grad():
+            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+                p_ema.lerp_(p, 1 - ema_beta)
+            for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+                b_ema.copy_(b)
+
+        acc["d_loss"] += d_loss.item()
+        acc["g_loss"] += g_loss.item()
+        acc["real_score"] += real_scores.mean().item()
+        acc["fake_score"] += fake_scores.mean().item()
+        acc["n"] += 1
+
+        if it % args.log_every == 0 or it == args.iters:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            sec = (time.time() - t_log) / acc["n"]
+            history["iter"].append(it)
+            history["epoch"].append(batches.epoch)
+            history["kimg"].append(it * args.batch_size / 1000)
+            for k in ("d_loss", "g_loss", "real_score", "fake_score"):
+                history[k].append(acc[k] / acc["n"])
+            history["r1"].append(last_r1)
+            history["sec_per_iter"].append(sec)
+            print(f"iter {it:6d}/{args.iters} | kimg {history['kimg'][-1]:7.1f} | epoch {batches.epoch:3d} "
+                  f"| D {history['d_loss'][-1]:.4f} | G {history['g_loss'][-1]:.4f} "
+                  f"| D(real) {history['real_score'][-1]:+.3f} D(fake) {history['fake_score'][-1]:+.3f} "
+                  f"| R1 {last_r1:.4f} | {sec * 1000:.1f} ms/iter", flush=True)
+            acc = dict(d_loss=0.0, g_loss=0.0, real_score=0.0, fake_score=0.0, n=0)
+            t_log = time.time()
+
+        if it % args.sample_every == 0 or it == args.iters:
+            save_samples(G_ema, fixed_z, os.path.join(run_dir, "samples", f"iter_{it:06d}.png"))
+        if it % args.snapshot_every == 0 or it == args.iters:
+            torch.save(G_ema.state_dict(), os.path.join(run_dir, "snapshots", f"generator_{it:06d}.pt"))
+        if it % args.checkpoint_every == 0 or it == args.iters:
+            torch.save(dict(generator=G.state_dict(), discriminator=D.state_dict(), generator_ema=G_ema.state_dict(),
+                            g_opt=g_opt.state_dict(), d_opt=d_opt.state_dict(), fixed_z=fixed_z.cpu(),
+                            history=history, iter=it, epoch=batches.epoch,
+                            batch_rng=batches.gen.get_state()), ckpt_path)
+            plot_history(history, os.path.join(run_dir, "loss_curves.png"), STYLEGAN_PANELS)
+            with open(os.path.join(run_dir, "history.json"), "w") as f:
+                json.dump(history, f)
+
+    save_samples(G_ema, torch.randn(64, args.latent_dim, device=device),
+                 os.path.join(run_dir, "random_samples_final.png"))
+    return dict(generator_params=count_parameters(G), discriminator_params=count_parameters(D),
+                r1_gamma=gamma, ema_beta=ema_beta)
+
+
+MODEL_DEFAULTS = {"wgan-gp": dict(lr=1e-4, latent_dim=100), "stylegan2": dict(lr=0.0025, latent_dim=512)}
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Train a generative model on ADNI or OASIS brain slices.")
-    p.add_argument("--model", choices=["wgan-gp"], default="wgan-gp")
+    p.add_argument("--model", choices=["wgan-gp", "stylegan2"], default="wgan-gp")
     p.add_argument("--dataset", choices=["adni", "oasis"], default="adni")
     p.add_argument("--resolution", type=int, default=64)
     p.add_argument("--run_name", required=True)
     p.add_argument("--iters", type=int, default=15100, help="generator iterations (Lab 2: 100 OASIS epochs = 15,100)")
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--latent_dim", type=int, default=100)
-    p.add_argument("--n_critic", type=int, default=5)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--lambda_gp", type=float, default=10.0)
+    p.add_argument("--latent_dim", type=int, default=None, help="default: 100 (wgan-gp), 512 (stylegan2)")
+    p.add_argument("--lr", type=float, default=None, help="default: 1e-4 (wgan-gp), 0.0025 (stylegan2)")
+    p.add_argument("--n_critic", type=int, default=5, help="wgan-gp only")
+    p.add_argument("--lambda_gp", type=float, default=10.0, help="wgan-gp only")
+    p.add_argument("--r1_gamma", type=float, default=None, help="stylegan2: default 0.0002 * res^2 / batch")
+    p.add_argument("--r1_every", type=int, default=16, help="stylegan2: lazy R1 interval")
+    p.add_argument("--channel_base", type=int, default=8192, help="stylegan2: channels = base / resolution")
+    p.add_argument("--max_channels", type=int, default=256, help="stylegan2: channel cap")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--sample_every", type=int, default=1000)
     p.add_argument("--snapshot_every", type=int, default=2500, help="keep generator weights at this interval")
@@ -217,8 +365,13 @@ def main():
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--out_root", default=os.path.join(here, "outputs", "runs"))
     args = p.parse_args()
+    for k, v in MODEL_DEFAULTS[args.model].items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
 
     torch.manual_seed(args.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True  # faster matmuls on A100; convolutions already use TF32
+    torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_dir = os.path.join(args.out_root, args.run_name)
     if os.path.exists(os.path.join(run_dir, "checkpoint.pt")) and not args.resume:
@@ -236,11 +389,12 @@ def main():
           f"{len(images) // args.batch_size} iterations per epoch")
 
     t0 = time.time()
-    info = train_wgan_gp(args, batches, device, run_dir)
+    info = (train_wgan_gp if args.model == "wgan-gp" else train_stylegan2)(args, batches, device, run_dir)
     elapsed = time.time() - t0
 
     summary = dict(info, model=args.model, dataset=args.dataset, resolution=args.resolution,
-                   iters=args.iters, epochs=batches.epoch, train_seconds=round(elapsed, 1),
+                   iters=args.iters, kimg=args.iters * args.batch_size / 1000, epochs=batches.epoch,
+                   train_seconds=round(elapsed, 1),
                    peak_gpu_gb=round(torch.cuda.max_memory_allocated() / 1e9, 3) if device.type == "cuda" else None)
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
