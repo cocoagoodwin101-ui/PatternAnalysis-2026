@@ -67,7 +67,7 @@ import torch
 
 from audit import SSIMIndex, _join
 from dataset import DEFAULT_CACHE, get_adni_splits
-from modules import WGANGenerator
+from modules import StyleGAN2Generator, WGANGenerator
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +90,9 @@ def snapshot_iter(path):
 def build_generator(config, device):
     if config["model"] == "wgan-gp":
         return WGANGenerator(config["latent_dim"], config["resolution"]).to(device)
+    if config["model"] == "stylegan2":  # snapshots hold the EMA generator; sampled without truncation
+        return StyleGAN2Generator(config["resolution"], z_dim=config["latent_dim"],
+                                  channel_base=config["channel_base"], max_channels=config["max_channels"]).to(device)
     raise ValueError(f"Unknown model {config['model']}")
 
 
@@ -97,6 +100,7 @@ def build_generator(config, device):
 def generate(generator, n, latent_dim, device, seed, batch=500):
     """n generated slices as uint8 (n, 1, R, R), quantised the same way as the real data."""
     generator.eval()
+    torch.manual_seed(seed)  # StyleGAN2's per-pixel noise uses the global generator
     g = torch.Generator(device=device).manual_seed(seed)
     out = []
     for s in range(0, n, batch):
