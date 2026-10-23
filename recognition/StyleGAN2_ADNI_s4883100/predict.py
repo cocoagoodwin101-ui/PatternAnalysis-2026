@@ -36,6 +36,15 @@ samples (independent draws), after averaging each query's difference over the su
 The single validation split is not resampled; pairing removes its shared bias but not
 all of its sampling variability.
 
+Fidelity and coverage: FID (Heusel et al., 2017) and improved precision and recall
+(Kynkaanniemi et al., 2019), all on Inception-v3 pool features of generated slices
+against the held-out test slices, at equal sample sizes. FID is lower for distributions
+that match better; precision is the share of generated slices that fall within the real
+data's feature manifold (realism), recall the share of real slices that fall within the
+generated manifold (coverage). The validation split scored against the test split gives a
+real-vs-real reference: what a perfect generator would score at these sample sizes. Uses
+the standard FID Inception weights from the pytorch-fid package.
+
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
     python predict.py --run_name wgan_adni64 --snapshots all    # flag rate across training
@@ -53,6 +62,7 @@ import os
 import re
 import time
 
+import numpy as np
 import torch
 
 from audit import SSIMIndex, _join
@@ -266,6 +276,55 @@ def print_gap(label, metric, g):
 
 
 # --------------------------------------------------------------------------- #
+# Fidelity and coverage
+# --------------------------------------------------------------------------- #
+def inception_model(device):
+    """The Inception-v3 used for standard FID (pytorch-fid), returning 2048-d pool features."""
+    try:
+        from pytorch_fid.inception import InceptionV3
+    except ImportError as e:
+        raise SystemExit("pytorch-fid is not installed: pip install pytorch-fid (or run with --no_fidelity)") from e
+    return InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
+
+
+@torch.no_grad()
+def inception_features(model, images_uint8, device, batch=250):
+    """(N, 2048) features. Grey slices are repeated to 3 channels; the model resizes to 299 px."""
+    feats = []
+    for s in range(0, len(images_uint8), batch):
+        x = images_uint8[s:s + batch].to(device).float().div(255).repeat(1, 3, 1, 1)
+        feats.append(model(x)[0].flatten(1).double().cpu())
+    return torch.cat(feats)
+
+
+def fid_from_features(a, b):
+    from pytorch_fid.fid_score import calculate_frechet_distance
+    a, b = a.numpy(), b.numpy()
+    return float(calculate_frechet_distance(a.mean(0), np.cov(a, rowvar=False), b.mean(0), np.cov(b, rowvar=False)))
+
+
+def precision_recall(real, fake, k=3, device="cpu"):
+    """Improved precision and recall: k-nearest-neighbour balls around each set's samples."""
+    real, fake = real.float().to(device), fake.float().to(device)
+
+    def radii(x):
+        d = torch.cdist(x, x)
+        d.fill_diagonal_(float("inf"))
+        return d.kthvalue(k, dim=1).values
+
+    r_real, r_fake = radii(real), radii(fake)
+    d = torch.cdist(fake, real)  # (fake, real)
+    precision = (d <= r_real[None, :]).any(dim=1).float().mean()
+    recall = (d.T <= r_fake[None, :]).any(dim=1).float().mean()
+    return float(precision), float(recall)
+
+
+def fidelity(feats, test_feats, device):
+    p, r = precision_recall(test_feats, feats, device=device)
+    return dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, n=len(feats), n_test=len(test_feats))
+
+
+# --------------------------------------------------------------------------- #
 # Figures
 # --------------------------------------------------------------------------- #
 def plot_distributions(res, ladder, ref, path, title):
@@ -331,6 +390,7 @@ def main():
     p.add_argument("--snapshots", choices=["last", "all"], default="last")
     p.add_argument("--n_samples", type=int, default=3100, help="default matches the number of test-stranger slices")
     p.add_argument("--seed", type=int, default=0, help="latent sampling seed")
+    p.add_argument("--no_fidelity", action="store_true", help="skip FID and precision/recall")
     p.add_argument("--ref_subsets", type=int, default=5,
                    help="random training-patient subsets for the matched-reference test")
     p.add_argument("--audit_dir", default=os.path.join(here, "outputs", "audit"))
@@ -365,6 +425,13 @@ def main():
     subsets = matched_subsets(train, val, args.ref_subsets, calib["seed"])
     print(f"Matched references: validation {len(val)} slices; {args.ref_subsets} training subsets of "
           f"{min(len(c) for c in subsets)}-{max(len(c) for c in subsets)} slices from the same patient numbers")
+    fid_ref = None
+    if not args.no_fidelity:
+        inception = inception_model(device)
+        test_feats = inception_features(inception, test_split.images, device)
+        fid_ref = fidelity(inception_features(inception, val.images, device), test_feats, device)
+        print(f"Fidelity reference (real validation vs real test slices): FID {fid_ref['fid']:.2f}, "
+              f"precision {fid_ref['precision']:.3f}, recall {fid_ref['recall']:.3f}")
     joint = _join(refs, SSIMIndex(test_split.images, device, calib["brain_threshold"]))
     test_gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
     del joint
@@ -386,13 +453,25 @@ def main():
         gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
         del joint
         excess = paired_excess(gap, test_gap, test_split.subject_idx, seed=args.seed)
+        fid_res = None if args.no_fidelity else fidelity(inception_features(inception, gen, device), test_feats, device)
         results[it] = dict(s, checks=checks, matched_reference=strip_per_query(gap), paired_excess=excess,
-                           search_seconds=round(time.time() - t0, 1))
+                           fidelity=fid_res, search_seconds=round(time.time() - t0, 1))
         for metric in ("whole", "masked"):
             r = s[metric]
             print(f"{it:>6} {metric:<7} {r['flagged']:>8} {r['flag_rate']:>7.2%} "
                   f"[{r['ci95'][0]:6.2%}, {r['ci95'][1]:6.2%}] "
                   + " ".join(f"{q:>7.4f}" for q in r["nn_ssim_p5_p50_p95"]))
+
+    if fid_ref is not None:
+        print(f"\nFidelity and coverage against held-out test slices (Inception-v3 features, "
+              f"{args.n_samples} generated vs {fid_ref['n_test']} test)")
+        print(f"{'set':>14} {'FID':>8} {'precision':>10} {'recall':>8}")
+        print(f"{'real val':>14} {fid_ref['fid']:>8.2f} {fid_ref['precision']:>10.3f} {fid_ref['recall']:>8.3f}"
+              f"   <- real-vs-real reference ({fid_ref['n']} validation slices)")
+        for it_k, r in results.items():
+            f = r["fidelity"]
+            print(f"{'gen ' + str(it_k):>14} {f['fid']:>8.2f} {f['precision']:>10.3f} {f['recall']:>8.3f}")
+        print("(lower FID = closer distribution; precision = realism; recall = coverage of the real data)")
 
     print("\nMatched-reference test: nearest SSIM to training subsets vs to the validation split "
           "(equal patients and slices)")
@@ -443,6 +522,7 @@ def main():
     with open(os.path.join(out_dir, f"memorisation_{tag}.json"), "w") as f:
         json.dump(dict(run=args.run_name, n_samples=args.n_samples, seed=args.seed,
                        percentile=calib["percentile"], reference=ref, matched_reference_test_control=strip_per_query(test_gap),
+                       fidelity_reference=fid_ref,
                        snapshots=results), f, indent=2)
     title = f"{args.run_name}, iteration {it}, {args.n_samples} samples"
     plot_distributions(res, ladder, ref, os.path.join(args.fig_dir, f"{args.run_name}_audit.png"), title)

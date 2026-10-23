@@ -4,7 +4,7 @@
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:20:00
+#SBATCH --time=00:30:00
 #SBATCH --output=predict_%j.out
 #SBATCH --error=predict_%j.err
 
