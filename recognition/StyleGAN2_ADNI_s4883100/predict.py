@@ -56,9 +56,18 @@ Trade-off figure: FID and coverage against the masked flag rate for every evalua
 snapshot, with the real-vs-real reference marked; --compare adds other runs' saved
 results (e.g. the baseline) to the same axes.
 
+Model comparison (--compare_excess): the difference between two runs' matched-reference
+excesses at each shared snapshot iteration. Both runs are measured against the same
+references and the same control, so the control cancels and the difference reduces to
+the difference between the two generated sets' mean (train minus validation) gaps;
+both sets are independent draws, so the bootstrap resamples generated slices only and
+the interval is much narrower than either excess's own interval.
+
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
     python predict.py --run_name wgan_adni64 --snapshots all    # flag rate across training
+    python predict.py --run_name sg2_adni64 --snapshot 10000    # one iteration, figures named for it
+    python predict.py --run_name sg2_adni64 --snapshots all --compare wgan_adni64 --compare_excess wgan_adni64
 
 Outputs: results in outputs/eval/<run_name>/ (gitignored), and two figures in figures/:
 <run_name>_audit.png (similarity distributions) and <run_name>_nearest.png (generated
@@ -280,6 +289,28 @@ def paired_excess(gen_gap, ctrl_gap, ctrl_groups, n_boot=2000, seed=0):
     return out
 
 
+def model_difference(gap_a, gap_b, n_boot=2000, seed=0):
+    """Excess of run A minus excess of run B, i.e. A's mean gap minus B's, with a bootstrap CI.
+
+    Both are independent generated sets, so each is resampled by slice; each slice's gap is
+    first averaged over the shared training subsets.
+    """
+    g = torch.Generator().manual_seed(seed)
+    out = {}
+    for metric in ("whole", "masked"):
+        a = gap_a[metric]["per_query"].double()
+        b = gap_b[metric]["per_query"].double()
+        per_subset = (a.mean(0) - b.mean(0)).tolist()
+        aq, bq = a.mean(1), b.mean(1)
+        boot = (aq[torch.randint(len(aq), (n_boot, len(aq)), generator=g)].mean(1)
+                - bq[torch.randint(len(bq), (n_boot, len(bq)), generator=g)].mean(1))
+        out[metric] = dict(difference=float(aq.mean() - bq.mean()),
+                           ci95=[float(torch.quantile(boot, 0.025)), float(torch.quantile(boot, 0.975))],
+                           share_boot_le_0=float((boot <= 0).double().mean()),
+                           per_subset=per_subset, subsets_positive=int(sum(x > 0 for x in per_subset)))
+    return out
+
+
 def strip_per_query(gap):
     return {m: {k: v for k, v in d.items() if k != "per_query"} for m, d in gap.items()}
 
@@ -449,6 +480,11 @@ def main():
     p.add_argument("--run_name", required=True)
     p.add_argument("--runs_root", default=os.path.join(here, "outputs", "runs"))
     p.add_argument("--snapshots", choices=["last", "all"], default="last")
+    p.add_argument("--snapshot", type=int, default=None,
+                   help="evaluate only this iteration; outputs and figures get an _iterNNNNNN suffix")
+    p.add_argument("--compare_excess", nargs="*", default=[],
+                   help="other runs to compare on matched-reference excess at shared iterations "
+                        "(regenerates their samples; adds a few minutes per run)")
     p.add_argument("--n_samples", type=int, default=3100, help="default matches the number of test-stranger slices")
     p.add_argument("--seed", type=int, default=0, help="latent sampling seed")
     p.add_argument("--no_fidelity", action="store_true", help="skip FID, precision/recall and density/coverage")
@@ -499,9 +535,16 @@ def main():
     test_gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
     del joint
 
-    chosen = snaps if args.snapshots == "all" else snaps[-1:]
+    if args.snapshot is not None:
+        chosen = [p for p in snaps if snapshot_iter(p) == args.snapshot]
+        if not chosen:
+            raise SystemExit(f"No snapshot at iteration {args.snapshot}; available: "
+                             f"{[snapshot_iter(p) for p in snaps]}")
+    else:
+        chosen = snaps if args.snapshots == "all" else snaps[-1:]
+    suffix = f"_iter{args.snapshot:06d}" if args.snapshot is not None else ""
     generator = build_generator(config, device)
-    results = {}
+    results, gaps = {}, {}
     print(f"\n{'iter':>6} {'metric':<7} {'flagged':>8} {'rate':>7} {'95% CI':>17} "
           f"{'NN p5':>7} {'NN p50':>7} {'NN p95':>7}")
     for path in chosen:
@@ -515,6 +558,7 @@ def main():
         joint = _join(refs, SSIMIndex(gen, device, calib["brain_threshold"]))
         gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
         del joint
+        gaps[it] = gap
         excess = paired_excess(gap, test_gap, test_split.subject_idx, seed=args.seed)
         fid_res = None if args.no_fidelity else fidelity(inception_features(inception, gen, device), test_feats, device)
         results[it] = dict(s, checks=checks, matched_reference=strip_per_query(gap), paired_excess=excess,
@@ -524,6 +568,29 @@ def main():
             print(f"{it:>6} {metric:<7} {r['flagged']:>8} {r['flag_rate']:>7.2%} "
                   f"[{r['ci95'][0]:6.2%}, {r['ci95'][1]:6.2%}] "
                   + " ".join(f"{q:>7.4f}" for q in r["nn_ssim_p5_p50_p95"]))
+
+    comparisons = {}
+    for other in args.compare_excess:
+        try:
+            o_config, o_snaps = load_run(os.path.join(args.runs_root, other))
+        except (SystemExit, FileNotFoundError) as e:
+            print(f"--compare_excess {other}: {e}; skipped")
+            continue
+        if o_config["resolution"] != config["resolution"]:
+            print(f"--compare_excess {other}: different resolution; skipped")
+            continue
+        o_gen = build_generator(o_config, device)
+        comparisons[other] = {}
+        for path in o_snaps:
+            it_o = snapshot_iter(path)
+            if it_o not in gaps:
+                continue
+            o_gen.load_state_dict(torch.load(path, map_location=device))
+            o_imgs = generate(o_gen, args.n_samples, o_config["latent_dim"], device, args.seed)
+            joint = _join(refs, SSIMIndex(o_imgs, device, calib["brain_threshold"]))
+            o_gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
+            del joint
+            comparisons[other][it_o] = model_difference(gaps[it_o], o_gap, seed=args.seed)
 
     if fid_ref is not None:
         print(f"\nFidelity and coverage against held-out test slices (Inception-v3 features, "
@@ -565,6 +632,21 @@ def main():
                   f"{e['subsets_positive']:>4}/{len(e['per_subset'])}")
     print("(P(<=0) = share of bootstrap replicates with no excess; positive = subsets where generated exceeds control)")
 
+    for other, by_it in comparisons.items():
+        print(f"\nModel comparison: excess of {args.run_name} minus excess of {other} "
+              f"(the control cancels; bootstrap over generated slices)")
+        print(f"{'iter':>6} {'metric':<7} {'difference':>10} {'95% CI':>19} {'P(<=0)':>7} "
+              f"{'per-subset range':>19} {'positive':>8}")
+        for it_k in sorted(by_it):
+            for metric in ("whole", "masked"):
+                d = by_it[it_k][metric]
+                print(f"{it_k:>6} {metric:<7} {d['difference']:>+10.4f} [{d['ci95'][0]:+.4f}, {d['ci95'][1]:+.4f}] "
+                      f"{d['share_boot_le_0']:>7.3f} [{min(d['per_subset']):+.4f}, {max(d['per_subset']):+.4f}] "
+                      f"{d['subsets_positive']:>4}/{len(d['per_subset'])}")
+        if not by_it:
+            print("  no shared snapshot iterations")
+        print(f"(negative = {args.run_name} is pulled towards its training patients less than {other})")
+
     print("\nNeighbour concentration (same number of queries; NN = nearest training slice)")
     print(f"{'iter':>6} {'metric':<7} {'query set':<15} {'n':>5} {'distinct':>9} {'max rep':>7} "
           f"{'flagged':>8} {'flag dist':>10} {'flag pat':>9} {'flag rep':>8}")
@@ -583,19 +665,19 @@ def main():
     out_dir = os.path.join(args.out_root, args.run_name)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(args.fig_dir, exist_ok=True)
-    with open(os.path.join(out_dir, f"memorisation_{tag}.json"), "w") as f:
+    with open(os.path.join(out_dir, f"memorisation_{tag}{suffix}.json"), "w") as f:
         json.dump(dict(run=args.run_name, n_samples=args.n_samples, seed=args.seed,
                        percentile=calib["percentile"], reference=ref, matched_reference_test_control=strip_per_query(test_gap),
-                       fidelity_reference=fid_ref,
+                       fidelity_reference=fid_ref, model_comparisons=comparisons,
                        snapshots=results), f, indent=2)
     title = f"{args.run_name}, iteration {it}, {args.n_samples} samples"
-    plot_distributions(res, ladder, ref, os.path.join(args.fig_dir, f"{args.run_name}_audit.png"), title)
-    plot_nearest(gen, train.images, res, os.path.join(args.fig_dir, f"{args.run_name}_nearest.png"), title,
+    plot_distributions(res, ladder, ref, os.path.join(args.fig_dir, f"{args.run_name}{suffix}_audit.png"), title)
+    plot_nearest(gen, train.images, res, os.path.join(args.fig_dir, f"{args.run_name}{suffix}_nearest.png"), title,
                  args.seed)
-    print(f"\nSaved {out_dir}/memorisation_{tag}.json, figures/{args.run_name}_audit.png and "
-          f"figures/{args.run_name}_nearest.png (figures show iteration {it})")
+    print(f"\nSaved {out_dir}/memorisation_{tag}{suffix}.json, figures/{args.run_name}{suffix}_audit.png and "
+          f"figures/{args.run_name}{suffix}_nearest.png (figures show iteration {it})")
 
-    if fid_ref is not None:
+    if fid_ref is not None and args.snapshot is None:  # a single snapshot makes no curve
         runs = [(args.run_name, {str(k): v for k, v in results.items()})]
         for other in args.compare:
             path = os.path.join(args.out_root, other, f"memorisation_{tag}.json")
