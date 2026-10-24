@@ -23,8 +23,10 @@ real images applied lazily every 16 steps (scaled by 16, with the optimiser corr
 for the interval), gamma = 0.0002 * resolution^2 / batch size unless --r1_gamma is set;
 and an exponential moving average (EMA) of the generator, with a half-life of
 10 * batch / 32 thousand images, which is used for all samples, snapshots and
-evaluation. Not yet included: style-mixing and path-length regularisation, and adaptive
-augmentation. One iteration shows the discriminator one real batch, so thousands of
+evaluation. With --ada, adaptive discriminator augmentation (modules.AdaptiveAugment)
+augments every image the discriminator sees, including in the R1 step, with p updated
+every 4 iterations towards E[sign(D(real))] = 0.6 (Karras et al., 2020b). Not included:
+style-mixing and path-length regularisation. One iteration shows the discriminator one real batch, so thousands of
 real images seen (kimg) = iterations * batch size / 1000, the same count as for WGAN-GP.
 
 Usage (GPU job on Rangpur, see train.sh):
@@ -50,8 +52,8 @@ import torch.optim as optim
 from torchvision.utils import save_image
 
 from dataset import DEFAULT_CACHE, DEFAULT_SEED, OASISSlices, get_adni_splits
-from modules import (StyleGAN2Discriminator, StyleGAN2Generator, WGANCritic, WGANGenerator, count_parameters,
-                     d_logistic_loss, g_nonsaturating_loss, gradient_penalty, r1_penalty)
+from modules import (AdaptiveAugment, StyleGAN2Discriminator, StyleGAN2Generator, WGANCritic, WGANGenerator,
+                     count_parameters, d_logistic_loss, g_nonsaturating_loss, gradient_penalty, r1_penalty)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +107,7 @@ WGAN_PANELS = [("WGAN-GP losses", [("critic_loss", "critic loss"), ("gen_loss", 
 STYLEGAN_PANELS = [("StyleGAN2 losses", [("d_loss", "discriminator loss"), ("g_loss", "generator loss")]),
                    ("Discriminator scores", [("real_score", "D(real)"), ("fake_score", "D(fake)")]),
                    ("R1 penalty  ||grad D(real)||^2", [("r1", None)])]
+ADA_PANEL = ("ADA: augmentation probability p and r_t", [("ada_p", "p"), ("r_t", "r_t = E[sign(D(real))]")])
 
 
 def plot_history(history, path, panels):
@@ -237,8 +240,15 @@ def train_stylegan2(args, batches, device, run_dir):
     d_opt = optim.Adam(D.parameters(), lr=args.lr * c, betas=(0.0, 0.99 ** c))
     fixed_z = torch.randn(64, args.latent_dim, device=device,
                           generator=torch.Generator(device=device).manual_seed(args.seed))
+    aug = AdaptiveAugment(target=args.ada_target, ada_kimg=args.ada_kimg).to(device) if args.ada else None
+
+    def A(x):  # what the discriminator sees: augmented when ADA is on
+        return aug(x) if aug is not None else x
 
     keys = ("iter", "epoch", "kimg", "d_loss", "g_loss", "real_score", "fake_score", "r1", "sec_per_iter")
+    if aug is not None:
+        keys += ("ada_p", "r_t")
+    panels = STYLEGAN_PANELS + ([ADA_PANEL] if aug is not None else [])
     history = {k: [] for k in keys}
     start_iter, ckpt_path = 0, os.path.join(run_dir, "checkpoint.pt")
     if args.resume and os.path.exists(ckpt_path):
@@ -246,6 +256,8 @@ def train_stylegan2(args, batches, device, run_dir):
         for module, key in ((G, "generator"), (D, "discriminator"), (G_ema, "generator_ema"),
                             (g_opt, "g_opt"), (d_opt, "d_opt")):
             module.load_state_dict(ckpt[key])
+        if aug is not None:
+            aug.load_state_dict(ckpt["ada"])
         fixed_z, history, start_iter = ckpt["fixed_z"].to(device), ckpt["history"], ckpt["iter"]
         batches.gen.set_state(ckpt["batch_rng"].cpu())
         batches.epoch = ckpt["epoch"]
@@ -253,6 +265,10 @@ def train_stylegan2(args, batches, device, run_dir):
     print(f"Generator {count_parameters(G):,} parameters (mapping {count_parameters(G.mapping):,}), "
           f"discriminator {count_parameters(D):,}")
     print(f"R1 gamma {gamma:.4g} every {args.r1_every} iterations; EMA beta {ema_beta:.6f} per iteration")
+    if aug is not None:
+        print(f"ADA on: target r_t {args.ada_target}, p updated every {args.ada_interval} iterations, "
+              f"p can change by 1 per {args.ada_kimg} kimg; starting p {float(aug.p):.3f}")
+    last_rt = float("nan")
 
     acc = dict(d_loss=0.0, g_loss=0.0, real_score=0.0, fake_score=0.0, n=0)
     last_r1 = float("nan")
@@ -264,15 +280,19 @@ def train_stylegan2(args, batches, device, run_dir):
         z = torch.randn(real.size(0), args.latent_dim, device=device)
         with torch.no_grad():
             fake = G(z)
-        real_scores, fake_scores = D(real), D(fake)
+        real_scores, fake_scores = D(A(real)), D(A(fake))
         d_loss = d_logistic_loss(real_scores, fake_scores)
         d_opt.zero_grad(set_to_none=True)
         d_loss.backward()
         d_opt.step()
+        if aug is not None:
+            aug.accumulate(real_scores)
+            if it % args.ada_interval == 0:
+                last_rt = aug.update(args.batch_size, args.ada_interval)
 
         # Lazy R1 on real images, scaled by the interval so its average weight is gamma / 2.
         if it % args.r1_every == 0:
-            r1 = r1_penalty(D, real)
+            r1 = r1_penalty(D, A(real).detach())
             d_opt.zero_grad(set_to_none=True)
             (gamma / 2 * r1 * args.r1_every).backward()
             d_opt.step()
@@ -280,7 +300,7 @@ def train_stylegan2(args, batches, device, run_dir):
 
         # Generator step: non-saturating loss; also updates the running average of w.
         z = torch.randn(real.size(0), args.latent_dim, device=device)
-        g_loss = g_nonsaturating_loss(D(G(z, track_w_avg=True)))
+        g_loss = g_nonsaturating_loss(D(A(G(z, track_w_avg=True))))
         g_opt.zero_grad(set_to_none=True)
         g_loss.backward()
         g_opt.step()
@@ -309,10 +329,14 @@ def train_stylegan2(args, batches, device, run_dir):
                 history[k].append(acc[k] / acc["n"])
             history["r1"].append(last_r1)
             history["sec_per_iter"].append(sec)
+            if aug is not None:
+                history["ada_p"].append(float(aug.p))
+                history["r_t"].append(last_rt)
             print(f"iter {it:6d}/{args.iters} | kimg {history['kimg'][-1]:7.1f} | epoch {batches.epoch:3d} "
                   f"| D {history['d_loss'][-1]:.4f} | G {history['g_loss'][-1]:.4f} "
                   f"| D(real) {history['real_score'][-1]:+.3f} D(fake) {history['fake_score'][-1]:+.3f} "
-                  f"| R1 {last_r1:.4f} | {sec * 1000:.1f} ms/iter", flush=True)
+                  f"| R1 {last_r1:.4f} | {sec * 1000:.1f} ms/iter"
+                  + (f" | p {float(aug.p):.3f} r_t {last_rt:.3f}" if aug is not None else ""), flush=True)
             acc = dict(d_loss=0.0, g_loss=0.0, real_score=0.0, fake_score=0.0, n=0)
             t_log = time.time()
 
@@ -323,15 +347,16 @@ def train_stylegan2(args, batches, device, run_dir):
         if it % args.checkpoint_every == 0 or it == args.iters:
             torch.save(dict(generator=G.state_dict(), discriminator=D.state_dict(), generator_ema=G_ema.state_dict(),
                             g_opt=g_opt.state_dict(), d_opt=d_opt.state_dict(), fixed_z=fixed_z.cpu(),
-                            history=history, iter=it, epoch=batches.epoch,
-                            batch_rng=batches.gen.get_state()), ckpt_path)
-            plot_history(history, os.path.join(run_dir, "loss_curves.png"), STYLEGAN_PANELS)
+                            history=history, iter=it, epoch=batches.epoch, batch_rng=batches.gen.get_state(),
+                            ada=aug.state_dict() if aug is not None else None), ckpt_path)
+            plot_history(history, os.path.join(run_dir, "loss_curves.png"), panels)
             with open(os.path.join(run_dir, "history.json"), "w") as f:
                 json.dump(history, f)
 
     save_samples(G_ema, torch.randn(64, args.latent_dim, device=device),
                  os.path.join(run_dir, "random_samples_final.png"))
     return dict(generator_params=count_parameters(G), discriminator_params=count_parameters(D),
+                final_ada_p=float(aug.p) if aug is not None else None,
                 r1_gamma=gamma, ema_beta=ema_beta)
 
 
@@ -355,6 +380,10 @@ def main():
     p.add_argument("--r1_every", type=int, default=16, help="stylegan2: lazy R1 interval")
     p.add_argument("--channel_base", type=int, default=8192, help="stylegan2: channels = base / resolution")
     p.add_argument("--max_channels", type=int, default=256, help="stylegan2: channel cap")
+    p.add_argument("--ada", action="store_true", help="stylegan2: adaptive discriminator augmentation")
+    p.add_argument("--ada_target", type=float, default=0.6, help="stylegan2 ADA: target E[sign(D(real))]")
+    p.add_argument("--ada_interval", type=int, default=4, help="stylegan2 ADA: iterations between p updates")
+    p.add_argument("--ada_kimg", type=float, default=500, help="stylegan2 ADA: kimg for p to change by 1")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--sample_every", type=int, default=1000)
     p.add_argument("--snapshot_every", type=int, default=2500, help="keep generator weights at this interval")
