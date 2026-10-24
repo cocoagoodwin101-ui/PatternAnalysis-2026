@@ -16,6 +16,15 @@ and R1 regularisation. Simplifications, chosen for clarity: resampling uses bili
 upsampling and average pooling instead of transposed convolutions with FIR blur filters,
 and the network is narrower than the paper's (channels capped at 256 by default) to fit
 the compute budget.
+
+Adaptive discriminator augmentation (ADA; Karras et al., 2020, "Training generative
+adversarial networks with limited data"): every image the discriminator sees, real or
+generated, is randomly augmented with probability p, and p is tuned during training so
+the discriminator cannot simply memorise the training set. Implemented here with the
+subset of ADA's augmentations that suit single-channel, skull-stripped MRI slices:
+integer translation, isotropic scaling and rotation (one affine warp), and brightness
+and contrast. Flips are left out because a mirrored sagittal slice is anatomically
+wrong (front and back swap), and colour augmentations do not apply to greyscale.
 """
 
 import math
@@ -374,3 +383,70 @@ def r1_penalty(discriminator, real):
     scores = discriminator(real)
     grad, = torch.autograd.grad(scores.sum(), real, create_graph=True)
     return grad.pow(2).flatten(1).sum(1).mean()
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive discriminator augmentation (ADA)
+# --------------------------------------------------------------------------- #
+class AdaptiveAugment(nn.Module):
+    """Differentiable augmentation applied to every discriminator input, with adaptive p.
+
+    Each augmentation is applied to each image independently with probability p, so for
+    p < 1 the discriminator still sees un-augmented images and the generator is not
+    pushed to produce augmented-looking output (augmentations do not "leak").
+
+    p adapts to r_t = E[sign(D(real))], the share of real images the discriminator is
+    confidently right about: above `target` the discriminator is overfitting, so p rises;
+    below it, p falls. p can move from 0 to 1 within `ada_kimg` thousand real images.
+    """
+
+    def __init__(self, target=0.6, ada_kimg=500, translate=0.125, scale_std=0.2, rotate_max=math.pi,
+                 brightness_std=0.2, contrast_std=0.5):
+        super().__init__()
+        self.register_buffer("p", torch.zeros(()))
+        self.target, self.ada_kimg = target, ada_kimg
+        self.translate, self.scale_std, self.rotate_max = translate, scale_std, rotate_max
+        self.brightness_std, self.contrast_std = brightness_std, contrast_std
+        self._signs, self._count = 0.0, 0
+
+    def forward(self, x):
+        p = float(self.p)
+        if p <= 0:
+            return x
+        b, device = x.size(0), x.device
+
+        def chosen():
+            return (torch.rand(b, device=device) < p).float()
+
+        # Geometric: one affine warp per image combining translation, scaling and rotation.
+        tx = chosen() * torch.round((torch.rand(b, device=device) * 2 - 1) * self.translate * x.size(3)) * 2 / x.size(3)
+        ty = chosen() * torch.round((torch.rand(b, device=device) * 2 - 1) * self.translate * x.size(2)) * 2 / x.size(2)
+        log_s = chosen() * torch.randn(b, device=device) * self.scale_std * math.log(2)
+        angle = chosen() * (torch.rand(b, device=device) * 2 - 1) * self.rotate_max
+        inv_s = torch.exp(-log_s)  # affine_grid maps output to input coordinates
+        cos, sin = torch.cos(angle) * inv_s, torch.sin(angle) * inv_s
+        theta = torch.stack([torch.stack([cos, -sin, tx], 1), torch.stack([sin, cos, ty], 1)], 1)
+        grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+        # Shift so the black background (-1) maps to 0 before zero padding, then shift back.
+        x = F.grid_sample(x + 1, grid, mode="bilinear", padding_mode="zeros", align_corners=False) - 1
+
+        # Intensity: brightness offset, then contrast scaling about each image's mean.
+        x = x + (chosen() * torch.randn(b, device=device) * self.brightness_std).view(b, 1, 1, 1)
+        c = torch.exp(chosen() * torch.randn(b, device=device) * self.contrast_std * math.log(2)).view(b, 1, 1, 1)
+        mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        return (x - mean) * c + mean
+
+    def accumulate(self, real_scores):
+        """Record sign(D(real)) for the next p update."""
+        self._signs += float(torch.sign(real_scores.detach()).sum())
+        self._count += real_scores.numel()
+
+    def update(self, batch_size, interval):
+        """Adjust p from r_t over the images seen since the last update; returns r_t."""
+        if self._count == 0:
+            return float("nan")
+        r_t = self._signs / self._count
+        step = batch_size * interval / (self.ada_kimg * 1000)
+        self.p.copy_((self.p + math.copysign(step, r_t - self.target)).clamp(0.0, 1.0))
+        self._signs, self._count = 0.0, 0
+        return r_t
