@@ -45,6 +45,17 @@ generated manifold (coverage). The validation split scored against the test spli
 real-vs-real reference: what a perfect generator would score at these sample sizes. Uses
 the standard FID Inception weights from the pytorch-fid package.
 
+Density and coverage (Naeem et al., 2020) complement precision and recall: both use only
+the real slices' k-nearest-neighbour balls (k = 5), so generated outliers cannot inflate
+them. Density counts how many real balls each generated slice falls into (about 1 when
+generated slices are distributed like real ones); coverage is the share of real slices
+whose ball contains at least one generated slice, the more robust measure of how much of
+the real variety the generator reproduces.
+
+Trade-off figure: FID and coverage against the masked flag rate for every evaluated
+snapshot, with the real-vs-real reference marked; --compare adds other runs' saved
+results (e.g. the baseline) to the same axes.
+
 Usage (GPU job on Rangpur, see predict.sh; run audit.py at the same resolution first):
     python predict.py --run_name wgan_adni64                    # final snapshot
     python predict.py --run_name wgan_adni64 --snapshots all    # flag rate across training
@@ -307,30 +318,76 @@ def fid_from_features(a, b):
     return float(calculate_frechet_distance(a.mean(0), np.cov(a, rowvar=False), b.mean(0), np.cov(b, rowvar=False)))
 
 
+def knn_radii(x, k):
+    """Distance from each sample to its k-th nearest neighbour within the same set."""
+    d = torch.cdist(x, x)
+    d.fill_diagonal_(float("inf"))
+    return d.kthvalue(k, dim=1).values
+
+
 def precision_recall(real, fake, k=3, device="cpu"):
     """Improved precision and recall: k-nearest-neighbour balls around each set's samples."""
     real, fake = real.float().to(device), fake.float().to(device)
-
-    def radii(x):
-        d = torch.cdist(x, x)
-        d.fill_diagonal_(float("inf"))
-        return d.kthvalue(k, dim=1).values
-
-    r_real, r_fake = radii(real), radii(fake)
+    r_real, r_fake = knn_radii(real, k), knn_radii(fake, k)
     d = torch.cdist(fake, real)  # (fake, real)
     precision = (d <= r_real[None, :]).any(dim=1).float().mean()
     recall = (d.T <= r_fake[None, :]).any(dim=1).float().mean()
     return float(precision), float(recall)
 
 
+def density_coverage(real, fake, k=5, device="cpu"):
+    """Density and coverage: membership of generated samples in the real samples' k-NN balls."""
+    real, fake = real.float().to(device), fake.float().to(device)
+    inside = torch.cdist(fake, real) <= knn_radii(real, k)[None, :]  # (fake, real)
+    return float(inside.sum() / (k * len(fake))), float(inside.any(dim=0).float().mean())
+
+
 def fidelity(feats, test_feats, device):
     p, r = precision_recall(test_feats, feats, device=device)
-    return dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, n=len(feats), n_test=len(test_feats))
+    dens, cov = density_coverage(test_feats, feats, device=device)
+    return dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, density=dens, coverage=cov,
+                n=len(feats), n_test=len(test_feats))
 
 
 # --------------------------------------------------------------------------- #
 # Figures
 # --------------------------------------------------------------------------- #
+def plot_tradeoff(runs, fid_ref, ref_flag_rate, path):
+    """FID and coverage against the masked flag rate, one line per run, one point per snapshot.
+
+    `runs` is a list of (label, snapshots) where snapshots maps iteration -> saved results.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    for ax, key, label in ((axes[0], "fid", "FID (lower = more realistic)"),
+                           (axes[1], "coverage", "coverage (higher = more real variety reproduced)")):
+        for name, snaps in runs:
+            its = sorted(snaps, key=int)
+            pts = [(snaps[i]["masked"]["flag_rate"] * 100, snaps[i]["fidelity"][key],
+                    [x * 100 for x in snaps[i]["masked"]["ci95"]]) for i in its if snaps[i].get("fidelity")]
+            if not pts:
+                continue
+            x, y, ci = zip(*pts)
+            xerr = [[xi - c[0] for xi, c in zip(x, ci)], [c[1] - xi for xi, c in zip(x, ci)]]
+            line = ax.errorbar(x, y, xerr=xerr, marker="o", capsize=3, label=name)
+            for xi, yi, i in zip(x, y, its):
+                ax.annotate(f"{int(i) / 1000:g}k", (xi, yi), textcoords="offset points", xytext=(5, 5),
+                            fontsize=7, color=line[0].get_color())
+        ax.scatter([ref_flag_rate * 100], [fid_ref[key]], marker="*", s=200, color="k", zorder=5,
+                   label="real unseen patients (reference)")
+        ax.set_xlabel("masked flag rate, % (lower = less like the training slices)")
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
+    fig.suptitle("Fidelity vs memorisation across training snapshots (labels = iterations)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def plot_distributions(res, ladder, ref, path, title):
     import matplotlib
     matplotlib.use("Agg")
@@ -394,7 +451,9 @@ def main():
     p.add_argument("--snapshots", choices=["last", "all"], default="last")
     p.add_argument("--n_samples", type=int, default=3100, help="default matches the number of test-stranger slices")
     p.add_argument("--seed", type=int, default=0, help="latent sampling seed")
-    p.add_argument("--no_fidelity", action="store_true", help="skip FID and precision/recall")
+    p.add_argument("--no_fidelity", action="store_true", help="skip FID, precision/recall and density/coverage")
+    p.add_argument("--compare", nargs="*", default=[],
+                   help="other run names whose saved results are added to the trade-off figure")
     p.add_argument("--ref_subsets", type=int, default=5,
                    help="random training-patient subsets for the matched-reference test")
     p.add_argument("--audit_dir", default=os.path.join(here, "outputs", "audit"))
@@ -469,13 +528,14 @@ def main():
     if fid_ref is not None:
         print(f"\nFidelity and coverage against held-out test slices (Inception-v3 features, "
               f"{args.n_samples} generated vs {fid_ref['n_test']} test)")
-        print(f"{'set':>14} {'FID':>8} {'precision':>10} {'recall':>8}")
-        print(f"{'real val':>14} {fid_ref['fid']:>8.2f} {fid_ref['precision']:>10.3f} {fid_ref['recall']:>8.3f}"
-              f"   <- real-vs-real reference ({fid_ref['n']} validation slices)")
-        for it_k, r in results.items():
-            f = r["fidelity"]
-            print(f"{'gen ' + str(it_k):>14} {f['fid']:>8.2f} {f['precision']:>10.3f} {f['recall']:>8.3f}")
-        print("(lower FID = closer distribution; precision = realism; recall = coverage of the real data)")
+        print(f"{'set':>14} {'FID':>8} {'precision':>10} {'recall':>8} {'density':>8} {'coverage':>9}")
+        rows = [("real val", fid_ref)] + [("gen " + str(it_k), r["fidelity"]) for it_k, r in results.items()]
+        for name, f in rows:
+            print(f"{name:>14} {f['fid']:>8.2f} {f['precision']:>10.3f} {f['recall']:>8.3f} "
+                  f"{f['density']:>8.3f} {f['coverage']:>9.3f}"
+                  + (f"   <- real-vs-real reference ({f['n']} validation slices)" if name == "real val" else ""))
+        print("(lower FID = closer distribution; precision and density = realism; recall and coverage = how much "
+              "of the real data's variety is reproduced)")
 
     print("\nMatched-reference test: nearest SSIM to training subsets vs to the validation split "
           "(equal patients and slices)")
@@ -534,6 +594,23 @@ def main():
                  args.seed)
     print(f"\nSaved {out_dir}/memorisation_{tag}.json, figures/{args.run_name}_audit.png and "
           f"figures/{args.run_name}_nearest.png (figures show iteration {it})")
+
+    if fid_ref is not None:
+        runs = [(args.run_name, {str(k): v for k, v in results.items()})]
+        for other in args.compare:
+            path = os.path.join(args.out_root, other, f"memorisation_{tag}.json")
+            if not os.path.exists(path):
+                print(f"--compare {other}: no saved results at {path}, skipped")
+                continue
+            with open(path) as f:
+                saved = json.load(f)
+            if not saved.get("fidelity_reference") or "coverage" not in saved["fidelity_reference"]:
+                print(f"--compare {other}: saved results lack density/coverage; rerun predict.py for it first")
+                continue
+            runs.append((other, saved["snapshots"]))
+        trade_path = os.path.join(args.fig_dir, f"{args.run_name}_tradeoff.png")
+        plot_tradeoff(runs, fid_ref, ref["masked"]["test_flag_rate"], trade_path)
+        print(f"Saved figures/{args.run_name}_tradeoff.png ({len(runs)} run(s))")
 
 
 if __name__ == "__main__":
