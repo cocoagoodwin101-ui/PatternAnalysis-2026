@@ -350,7 +350,21 @@ The script prints only aggregate statistics and never writes patient IDs to disk
 
 ## 9. Dependencies
 
-*To be completed with exact versions.*
+All experiments ran on UQ's Rangpur cluster: one NVIDIA A100-PCIE-40GB per job, Slurm partition `comp3710`.
+
+| Package | Version | Used for |
+|---|---|---|
+| Python | 3.11.15 | |
+| PyTorch | 2.13.0 (CUDA 13.0) | all models, training, SSIM audit |
+| torchvision | 0.28.0 | image I/O, sample grids |
+| NumPy | 2.4.6 | evaluation and plotting only (not in model code) |
+| SciPy | 1.17.1 | FID matrix square root |
+| scikit-learn | 1.9.0 | PCA and t-SNE (`embed.py`) |
+| matplotlib | 3.11.1 | figures |
+| Pillow | 12.3.0 | JPEG loading |
+| pytorch-fid | 0.3.0 | standard FID Inception-v3 weights |
+
+**Reproducibility.** The patient split is deterministic (seed 42, `random.Random`); training seeds are fixed (`--seed`, default 42); evaluation samples use a fixed latent seed (`predict.py --seed`, default 0), including StyleGAN2's per-pixel noise. GPU convolutions are not bit-for-bit deterministic, so retraining reproduces the reported trends and approximately, not exactly, the reported numbers. Each configuration was trained once (Section 11.11).
 
 ## 10. Usage
 
