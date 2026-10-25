@@ -28,9 +28,9 @@ Medical imaging research is constrained by patient privacy law and limited scan 
 
 **How it works.** StyleGAN2 (Karras et al., 2020) generates an image in two stages. A mapping network of 8 fully connected layers turns a random latent vector *z* into a style vector *w*. A synthesis network then starts from a learned 4 × 4 constant and doubles the resolution up to 64 × 64; at every layer, *w* modulates the convolution weights (scaling them per input channel, then renormalising them, "demodulation"), and per-pixel noise adds fine stochastic detail. A residual discriminator, with a minibatch standard-deviation feature that exposes a lack of variety, scores images as real or generated. Training uses the non-saturating logistic loss with R1 regularisation, and samples come from an exponential moving average of the generator's weights. The baseline is my Lab 2 WGAN-GP: a DCGAN-style generator and critic trained with the Wasserstein loss and a gradient penalty. Every model is then measured three ways: **fidelity** (FID, precision, density and coverage against held-out patients), **memorisation** (the calibrated audit of Section 7, plus a matched-reference test that separates training-specific resemblance from general realism), and **class coverage** (a joint t-SNE embedding).
 
-| WGAN-GP baseline | StyleGAN2 (10,000 iterations) |
+| WGAN-GP baseline | StyleGAN2 (10,000 iterations, uncurated) |
 |---|---|
-| ![Baseline samples](figures/wgan_adni64_random_samples.png) | ![StyleGAN2 samples](figures/sg2_adni64_samples.png) |
+| ![Baseline samples](figures/wgan_adni64_random_samples.png) | ![StyleGAN2 samples](figures/sg2_adni64_iter010000_uncurated_seed1.png) |
 
 *Uncurated generated ADNI slices at 64 × 64. StyleGAN2 produces sharper cortical folds, cleaner outlines and a wider range of head positions.*
 
@@ -495,9 +495,30 @@ The real slices are organised mostly by slice position: the lateral ends of each
 
 A 10-nearest-neighbour class vote in Inception space supports this, with a caveat. The features barely separate the classes (real validation slices: 56.4% balanced accuracy; predicted AD share 34.0% against a true 49.7%), so shares are indicative only. Against that 34% reference, generated cohorts look AD-like far less often: baseline 10.7%, StyleGAN2 13.4%, ADA at 15,100 iterations 19.1%. **Unconditional generation under-represents AD-typical anatomy.**
 
+The failure autopsy measures this directly: 71.9% of real AD test slices have no generated slice in their Inception neighbourhood, against 47.0% of CN slices (Section 11.7).
+
+
 ### 11.7 Failure autopsy
 
-[To complete once `autopsy.py` has run: the figure `figures/sg2_adni64_iter010000_autopsy.png`, one uncurated grid, and a diagnosis for each of the five rules (near-copy, least like real, off-manifold, dark, dropped mode).]
+![Failure autopsy](figures/sg2_adni64_iter010000_autopsy.png)
+
+*Rule-selected failure cases from all 3,100 slices of the recommended snapshot (StyleGAN2, 10,000 iterations; the near-copy row uses 12,500, where the audit found a copy-level slice). Each pair shows the case and its nearest neighbour. Selected by `autopsy.py`, not by hand.*
+
+To avoid cherry-picking, each row shows the top three slices under a fixed rule, and every generated case appears beside its nearest training slice, so the figure is also a memorisation check.
+
+| Rule | What the cases show | Likely cause | Memorised? |
+|---|---|---|---|
+| **Near-copy** (highest masked SSIM to training) | The top case (0.808) matches its training neighbour in outline, head tilt, ventricle shape and the white-matter band into the temporal lobe; only fine folds differ. It resembles a neighbouring slice of the same patient. The next two (0.769, 0.768) share the head position but differ in folds and size | Late-training drift towards training patients (Section 11.4); isolated: one slice in 3,100, none at 10,000 or 15,100 iterations | Borderline for the top case, which is just above the copy level of 0.796; the release filter (Section 11.10) removes such slices |
+| **Least like real** (lowest masked SSIM to any training slice, 0.345–0.349) | A very dim slice, a realistic slice with small bright specks, and a brain at the right edge of the frame | Rare modes of the training data (the nearest training slices are similarly dim or off-centre); the specks are a GAN artefact also seen in the baseline | No |
+| **Off-manifold** (farthest outside real slices' Inception neighbourhoods, 1.22–1.24 × radius) | Smudged, washed-out tissue with missing folds and the lower brain fading into the background; one over-bright white-matter band | Classic GAN texture failure: distorted tissue margins that Inception features detect | No (SSIM to training 0.42–0.63) |
+| **Dark** (lowest mean brain intensity, 42–45 of 255) | Dim, low-contrast slices | Faithful to dim but valid scans in the training data (Discovery 11), not a generator fault | No (0.40–0.44) |
+| **Dropped mode** (real AD test slices farthest from any generated slice, 1.61–1.71 × radius) | Large, high-contrast AD slices with enlarged ventricles and pronounced sulci; their nearest generated slices are smaller, lower in contrast, with narrower ventricles | The generator does not reproduce typical AD anatomy. 71.9% of real AD test slices have no generated slice in their neighbourhood, against 47.0% of CN slices. A plausible cause: AD slices come from fewer training patients (177 vs 365 CN, with more repeat scans), so AD anatomy is less varied in training than CN anatomy | Not applicable |
+
+![Uncurated samples](figures/sg2_adni64_iter010000_uncurated_seed1.png)
+
+*An uncurated 8 × 8 grid from the same snapshot (seed 1; a second seed is in `figures/sg2_adni64_iter010000_uncurated_seed2.png`). Most slices are realistic and varied; a few per grid are dim, as in the "dark" row. The autopsy cases are exceptions, not typical output.*
+
+Two practical consequences: the release filter should also consider a minimum brain-intensity check if dim slices are unwanted downstream, and the dropped-mode row is the concrete form of the AD under-representation in Section 11.6.
 
 ### 11.8 Resource profiling
 
@@ -508,7 +529,7 @@ A 10-nearest-neighbour class vote in Inception space supports this, with a cavea
 | Training time per iteration (batch 64) | 95 ms | 260 ms | 263 ms |
 | Training time, 15,100 iterations | 25 min | 67 min | 68 min |
 | Peak GPU memory, training | 0.43 GB | 5.6 GB | 5.6 GB |
-| Generation time per 1,000 slices | [ms] | [ms] | [ms] |
+| Generation time per 1,000 slices | 10 ms | 815 ms | 816 ms |
 | Full evaluation (`predict.py`, 7 snapshots, no model comparison) | about 12 min | about 12 min | about 12 min |
 
 All on one NVIDIA A100-PCIE-40GB. The whole project used about 8.2 A100-hours, measured with `sacct` across all 28 GPU jobs (training about 5.2 h, evaluation about 2.9 h, audit calibration under 5 min; the t-SNE embedding ran on a CPU node), well within the 30 A100-hour estimate in the feasibility review. No single job needed more than 70 minutes.
