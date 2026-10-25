@@ -511,7 +511,7 @@ A 10-nearest-neighbour class vote in Inception space supports this, with a cavea
 | Generation time per 1,000 slices | [ms] | [ms] | [ms] |
 | Full evaluation (`predict.py`, 7 snapshots, no model comparison) | about 12 min | about 12 min | about 12 min |
 
-All on one NVIDIA A100-PCIE-40GB. The whole project used about 8.6 A100-hours, measured with `sacct` across all 28 GPU jobs (training about 5.2 h, evaluation about 3.0 h, audit calibration under 5 min; the t-SNE embedding ran on a CPU node), well within the 30 A100-hour estimate in the feasibility review. No single job needed more than 70 minutes.
+All on one NVIDIA A100-PCIE-40GB. The whole project used about 8.2 A100-hours, measured with `sacct` across all 28 GPU jobs (training about 5.2 h, evaluation about 2.9 h, audit calibration under 5 min; the t-SNE embedding ran on a CPU node), well within the 30 A100-hour estimate in the feasibility review. No single job needed more than 70 minutes.
 
 ### 11.9 Acceptance criteria
 
