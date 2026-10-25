@@ -368,7 +368,50 @@ All experiments ran on UQ's Rangpur cluster: one NVIDIA A100-PCIE-40GB per job, 
 
 ## 10. Usage
 
-*To be completed.*
+All commands run from `recognition/StyleGAN2_ADNI_s4883100/` on Rangpur. Every `.sh` script is a Slurm batch script that passes its arguments through to the Python script of the same name.
+
+**Rangpur notes.** Jobs on the `comp3710` partition must use `#SBATCH --account=comp3710`, and must not request `--mem` (the nodes expose no schedulable memory; such jobs wait forever with reason `PartitionConfig`). The scripts here already do both.
+
+```bash
+# 1. Data: audit and preprocessing smoke test (CPU node)
+srun --partition=cpu --cpus-per-task=8 --time=00:45:00 --pty bash
+conda activate torch
+python data_audit.py
+python dataset.py --resolution 64          # builds the cached 64 px tensors, checks the split
+exit
+
+# 2. Calibrate the memorisation audit on real data (about 2 min)
+sbatch audit.sh
+
+# 3. Train (about 25 min for WGAN-GP, 67 min for StyleGAN2 at 64 px)
+sbatch train.sh --dataset oasis --run_name wgan_oasis64                       # verify the baseline port
+sbatch train.sh --dataset adni --run_name wgan_adni64                         # baseline
+sbatch train.sh --model stylegan2 --dataset oasis --run_name sg2_oasis64      # verify StyleGAN2
+sbatch train.sh --model stylegan2 --dataset adni --run_name sg2_adni64        # main model
+sbatch train.sh --model stylegan2 --dataset adni --run_name sg2_adni64_r1g01 --r1_gamma 0.1
+sbatch train.sh --model stylegan2 --dataset adni --run_name sg2_adni64_ada --ada
+# add --resume to continue a run that hit its time limit
+
+# 4. Evaluate every snapshot: memorisation audit, fidelity, trade-off figure, direct comparison
+sbatch predict.sh --run_name wgan_adni64 --snapshots all
+sbatch predict.sh --run_name sg2_adni64 --snapshots all --compare wgan_adni64 --compare_excess wgan_adni64
+sbatch predict.sh --run_name sg2_adni64 --snapshot 10000                     # figures for one snapshot
+
+# 5. Embedding and failure autopsy
+sbatch embed.sh --runs wgan_adni64:10000 sg2_adni64:10000 sg2_adni64_ada:15100
+sbatch autopsy.sh --run_name sg2_adni64 --iter 10000 --copy_iter 12500
+```
+
+**Outputs.** Training writes to `outputs/runs/<run_name>/` (config, loss history and curves, fixed-noise sample grids, generator snapshots every 2,500 iterations, a resumable checkpoint). Evaluation writes JSON results to `outputs/eval/<run_name>/` and figures to `figures/`. `outputs/` is gitignored; no weights or data are committed.
+
+**Example input and output.** The input to a trained generator is a random latent vector; the output is a 64 × 64 greyscale slice in [−1, 1]. `predict.py` loads a snapshot, generates 3,100 slices and prints tables such as:
+
+```text
+ iter metric   flagged    rate            95% CI   NN p5  NN p50  NN p95
+10000 masked       174   5.61% [ 4.86%,  6.48%]  0.5081  0.6229  0.7063
+      set      FID  precision   recall  density  coverage
+gen 10000    13.67      0.347    0.237    0.369     0.421
+```
 
 ## 11. Results
 
