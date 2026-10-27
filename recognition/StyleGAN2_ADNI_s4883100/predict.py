@@ -121,7 +121,6 @@ def build_generator(config, device):
     raise ValueError(f"Unknown model {config['model']}")
 
 
-@torch.no_grad()
 def class_labels(config, n, train_labels, seed):
     """For a class-conditional run: n labels (0 = CN, 1 = AD) in the training slices' class mix
     (deterministic counts, shuffled with the seed). None for unconditional runs."""
@@ -132,6 +131,7 @@ def class_labels(config, n, train_labels, seed):
     return labels[torch.randperm(n, generator=torch.Generator().manual_seed(seed))]
 
 
+@torch.no_grad()
 def generate(generator, n, latent_dim, device, seed, batch=500, labels=None):
     """n generated slices as uint8 (n, 1, R, R), quantised the same way as the real data.
 
