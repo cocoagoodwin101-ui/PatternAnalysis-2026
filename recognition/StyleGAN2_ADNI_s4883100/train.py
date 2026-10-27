@@ -25,9 +25,11 @@ and an exponential moving average (EMA) of the generator, with a half-life of
 10 * batch / 32 thousand images, which is used for all samples, snapshots and
 evaluation. With --ada, adaptive discriminator augmentation (modules.AdaptiveAugment)
 augments every image the discriminator sees, including in the R1 step, with p updated
-every 4 iterations towards E[sign(D(real))] = 0.6 (Karras et al., 2020b). Not included:
-style-mixing and path-length regularisation. One iteration shows the discriminator one real batch, so thousands of
-real images seen (kimg) = iterations * batch size / 1000, the same count as for WGAN-GP.
+every 4 iterations towards E[sign(D(real))] = 0.6 (Karras et al., 2020b). With
+--aug_p P, the same augmentations are applied with a fixed probability P instead (no
+adaptation). Not included: style-mixing and path-length regularisation. One iteration
+shows the discriminator one real batch, so thousands of real images seen (kimg) =
+iterations * batch size / 1000, the same count as for WGAN-GP.
 
 Usage (GPU job on Rangpur, see train.sh):
     python train.py --dataset oasis --iters 200 --run_name smoke       # quick check
@@ -240,7 +242,9 @@ def train_stylegan2(args, batches, device, run_dir):
     d_opt = optim.Adam(D.parameters(), lr=args.lr * c, betas=(0.0, 0.99 ** c))
     fixed_z = torch.randn(64, args.latent_dim, device=device,
                           generator=torch.Generator(device=device).manual_seed(args.seed))
-    aug = AdaptiveAugment(target=args.ada_target, ada_kimg=args.ada_kimg).to(device) if args.ada else None
+    aug = None
+    if args.ada or args.aug_p is not None:
+        aug = AdaptiveAugment(target=args.ada_target, ada_kimg=args.ada_kimg, fixed_p=args.aug_p).to(device)
 
     def A(x):  # what the discriminator sees: augmented when ADA is on
         return aug(x) if aug is not None else x
@@ -266,8 +270,11 @@ def train_stylegan2(args, batches, device, run_dir):
           f"discriminator {count_parameters(D):,}")
     print(f"R1 gamma {gamma:.4g} every {args.r1_every} iterations; EMA beta {ema_beta:.6f} per iteration")
     if aug is not None:
-        print(f"ADA on: target r_t {args.ada_target}, p updated every {args.ada_interval} iterations, "
-              f"p can change by 1 per {args.ada_kimg} kimg; starting p {float(aug.p):.3f}")
+        if aug.adaptive:
+            print(f"ADA on: target r_t {args.ada_target}, p updated every {args.ada_interval} iterations, "
+                  f"p can change by 1 per {args.ada_kimg} kimg; starting p {float(aug.p):.3f}")
+        else:
+            print(f"Fixed-probability augmentation: p = {float(aug.p):.3f} throughout (r_t measured, not used)")
     last_rt = float("nan")
 
     acc = dict(d_loss=0.0, g_loss=0.0, real_score=0.0, fake_score=0.0, n=0)
@@ -384,6 +391,8 @@ def main():
     p.add_argument("--ada_target", type=float, default=0.6, help="stylegan2 ADA: target E[sign(D(real))]")
     p.add_argument("--ada_interval", type=int, default=4, help="stylegan2 ADA: iterations between p updates")
     p.add_argument("--ada_kimg", type=float, default=500, help="stylegan2 ADA: kimg for p to change by 1")
+    p.add_argument("--aug_p", type=float, default=None,
+                   help="stylegan2: augment with this fixed probability instead of adapting it (no --ada needed)")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--sample_every", type=int, default=1000)
     p.add_argument("--snapshot_every", type=int, default=2500, help="keep generator weights at this interval")

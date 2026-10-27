@@ -401,9 +401,11 @@ class AdaptiveAugment(nn.Module):
     """
 
     def __init__(self, target=0.6, ada_kimg=500, translate=0.125, scale_std=0.2, rotate_max=math.pi,
-                 brightness_std=0.2, contrast_std=0.5):
+                 brightness_std=0.2, contrast_std=0.5, fixed_p=None):
         super().__init__()
-        self.register_buffer("p", torch.zeros(()))
+        # fixed_p: hold p constant (plain differentiable augmentation, no adaptation); r_t is still measured.
+        self.register_buffer("p", torch.tensor(float(fixed_p) if fixed_p is not None else 0.0))
+        self.adaptive = fixed_p is None
         self.target, self.ada_kimg = target, ada_kimg
         self.translate, self.scale_std, self.rotate_max = translate, scale_std, rotate_max
         self.brightness_std, self.contrast_std = brightness_std, contrast_std
@@ -446,7 +448,8 @@ class AdaptiveAugment(nn.Module):
         if self._count == 0:
             return float("nan")
         r_t = self._signs / self._count
-        step = batch_size * interval / (self.ada_kimg * 1000)
-        self.p.copy_((self.p + math.copysign(step, r_t - self.target)).clamp(0.0, 1.0))
+        if self.adaptive:
+            step = batch_size * interval / (self.ada_kimg * 1000)
+            self.p.copy_((self.p + math.copysign(step, r_t - self.target)).clamp(0.0, 1.0))
         self._signs, self._count = 0.0, 0
         return r_t
