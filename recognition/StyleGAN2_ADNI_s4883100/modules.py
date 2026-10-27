@@ -25,6 +25,13 @@ subset of ADA's augmentations that suit single-channel, skull-stripped MRI slice
 integer translation, isotropic scaling and rotation (one affine warp), and brightness
 and contrast. Flips are left out because a mirrored sagittal slice is anatomically
 wrong (front and back swap), and colour augmentations do not apply to greyscale.
+
+Class conditioning (optional, c_dim > 0), following StyleGAN2-ADA: the generator's mapping
+network embeds the one-hot class, normalises it and concatenates it with the normalised z,
+so every style vector depends on the class; the discriminator is a projection
+discriminator (Miyato and Koyama, 2018), adding the inner product of a learned class
+embedding with its final features to its score. With c_dim = 0 (the default) both
+networks are unchanged, so unconditional snapshots still load.
 """
 
 import math
@@ -165,16 +172,24 @@ class MappingNetwork(nn.Module):
     Keeps a running average of w (w_avg) for the truncation trick at sampling time.
     """
 
-    def __init__(self, z_dim=512, w_dim=512, n_layers=8, lr_mul=0.01, w_avg_beta=0.995):
+    def __init__(self, z_dim=512, w_dim=512, n_layers=8, lr_mul=0.01, w_avg_beta=0.995, c_dim=0):
         super().__init__()
-        dims = [z_dim] + [w_dim] * n_layers
+        self.c_dim = c_dim
+        # Conditional: one-hot class -> w_dim embedding, concatenated with z before the MLP.
+        self.embed = EqualLinear(c_dim, w_dim) if c_dim > 0 else None
+        dims = [z_dim + (w_dim if c_dim > 0 else 0)] + [w_dim] * n_layers
         self.net = nn.Sequential(*[EqualLinear(a, b, lr_mul=lr_mul, activation=True)
                                    for a, b in zip(dims[:-1], dims[1:])])
         self.register_buffer("w_avg", torch.zeros(w_dim))
         self.w_avg_beta = w_avg_beta
 
-    def forward(self, z, truncation=1.0, track_w_avg=False):
+    def forward(self, z, c=None, truncation=1.0, track_w_avg=False):
         z = z * torch.rsqrt(z.pow(2).mean(dim=1, keepdim=True) + 1e-8)  # pixel norm
+        if self.c_dim > 0:
+            if c is None:
+                raise ValueError("this mapping network is class-conditional: pass one-hot labels c")
+            y = self.embed(c.float())
+            z = torch.cat([z, y * torch.rsqrt(y.pow(2).mean(dim=1, keepdim=True) + 1e-8)], dim=1)
         w = self.net(z)
         if track_w_avg:
             self.w_avg.copy_(w.detach().mean(0).lerp(self.w_avg, self.w_avg_beta))
@@ -263,13 +278,14 @@ class StyleGAN2Generator(nn.Module):
     """
 
     def __init__(self, resolution=64, z_dim=512, w_dim=512, mapping_layers=8, channel_base=8192,
-                 max_channels=256, img_channels=1):
+                 max_channels=256, img_channels=1, c_dim=0):
         super().__init__()
         _stage_channels(resolution, 1)  # validates the resolution
         self.resolution, self.z_dim, self.w_dim = resolution, z_dim, w_dim
         self.latent_dim = z_dim  # common name used by train.py / predict.py
         ch = stylegan_channels(resolution, channel_base, max_channels)
-        self.mapping = MappingNetwork(z_dim, w_dim, mapping_layers)
+        self.c_dim = c_dim
+        self.mapping = MappingNetwork(z_dim, w_dim, mapping_layers, c_dim=c_dim)
         self.const = nn.Parameter(torch.randn(1, ch[4], 4, 4))
         self.layers = nn.ModuleList([StyledLayer(ch[4], ch[4], w_dim)])
         self.to_images = nn.ModuleList([ToImage(ch[4], w_dim, img_channels)])
@@ -300,8 +316,8 @@ class StyleGAN2Generator(nn.Module):
             img = to_image(x, ws[:, i], skip=img)
         return img
 
-    def forward(self, z, truncation=1.0, track_w_avg=False, return_ws=False, noise_mode="random"):
-        w = self.mapping(z, truncation=truncation, track_w_avg=track_w_avg)
+    def forward(self, z, c=None, truncation=1.0, track_w_avg=False, return_ws=False, noise_mode="random"):
+        w = self.mapping(z, c, truncation=truncation, track_w_avg=track_w_avg)
         ws = w.unsqueeze(1).expand(-1, self.num_ws, -1)
         img = self.synthesis(ws, noise_mode)
         return (img, ws) if return_ws else img
@@ -331,7 +347,7 @@ class StyleGAN2Discriminator(nn.Module):
     lack of variety (a guard against mode collapse).
     """
 
-    def __init__(self, resolution=64, channel_base=8192, max_channels=256, img_channels=1, mbstd_group=4):
+    def __init__(self, resolution=64, channel_base=8192, max_channels=256, img_channels=1, mbstd_group=4, c_dim=0):
         super().__init__()
         ch = stylegan_channels(resolution, channel_base, max_channels)
         self.from_image = EqualConv2d(img_channels, ch[resolution], 1)
@@ -344,6 +360,9 @@ class StyleGAN2Discriminator(nn.Module):
         self.conv = EqualConv2d(ch[4] + 1, ch[4], 3)
         self.fc = EqualLinear(ch[4] * 16, ch[4], activation=True)
         self.out = EqualLinear(ch[4], 1)
+        self.c_dim = c_dim
+        # Projection discriminator: score += <embed(c), features> / sqrt(features).
+        self.embed = EqualLinear(c_dim, ch[4]) if c_dim > 0 else None
 
     def minibatch_std(self, x):
         b, c, h, w = x.shape
@@ -355,10 +374,16 @@ class StyleGAN2Discriminator(nn.Module):
         y = y.mean(dim=(1, 2, 3)).view(-1, 1, 1, 1).repeat(g, 1, h, w)  # one value per group
         return torch.cat([x, y], dim=1)
 
-    def forward(self, img):
+    def forward(self, img, c=None):
         x = self.blocks(self.from_image(img))
         x = self.conv(self.minibatch_std(x))
-        return self.out(self.fc(x.flatten(1))).view(-1)
+        h = self.fc(x.flatten(1))
+        score = self.out(h).view(-1)
+        if self.c_dim > 0:
+            if c is None:
+                raise ValueError("this discriminator is class-conditional: pass one-hot labels c")
+            score = score + (self.embed(c.float()) * h).sum(dim=1) / math.sqrt(h.size(1))
+        return score
 
 
 # --------------------------------------------------------------------------- #
@@ -374,13 +399,13 @@ def g_nonsaturating_loss(fake_scores):
     return F.softplus(-fake_scores).mean()
 
 
-def r1_penalty(discriminator, real):
+def r1_penalty(discriminator, real, c=None):
     """R1 regularisation: squared gradient norm of D at real images (Mescheder et al., 2018).
 
     Returns the mean of ||grad D(real)||^2; the caller multiplies by gamma / 2.
     """
     real = real.detach().requires_grad_(True)
-    scores = discriminator(real)
+    scores = discriminator(real) if c is None else discriminator(real, c)
     grad, = torch.autograd.grad(scores.sum(), real, create_graph=True)
     return grad.pow(2).flatten(1).sum(1).mean()
 
