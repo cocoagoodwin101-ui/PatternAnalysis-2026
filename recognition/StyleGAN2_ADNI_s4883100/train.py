@@ -31,6 +31,12 @@ adaptation). Not included: style-mixing and path-length regularisation. One iter
 shows the discriminator one real batch, so thousands of real images seen (kimg) =
 iterations * batch size / 1000, the same count as for WGAN-GP.
 
+With --conditional (StyleGAN2 on ADNI only), both networks receive the diagnosis (CN or
+AD) as a one-hot label: real batches carry their own labels, and generated batches use
+labels drawn from the training slices, so both classes are generated in their training
+proportions. Fixed-noise sample grids show CN in the top four rows and AD in the bottom
+four.
+
 Usage (GPU job on Rangpur, see train.sh):
     python train.py --dataset oasis --iters 200 --run_name smoke       # quick check
     python train.py --dataset oasis --run_name wgan_oasis64            # reproduce Lab 2
@@ -50,6 +56,7 @@ import os
 import time
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torchvision.utils import save_image
 
@@ -69,8 +76,10 @@ class GPUBatches:
     batch is dropped, as in Lab 2.
     """
 
-    def __init__(self, images_uint8, batch_size, device, seed):
+    def __init__(self, images_uint8, batch_size, device, seed, labels=None):
         self.images = images_uint8.to(device)
+        self.labels = labels.to(device) if labels is not None else None
+        self.last_labels = None
         self.batch_size = batch_size
         self.gen = torch.Generator(device=device).manual_seed(seed)
         self.epoch, self._perm, self._pos = 0, None, len(self.images)
@@ -82,24 +91,33 @@ class GPUBatches:
             self.epoch += 1
         idx = self._perm[self._pos:self._pos + self.batch_size]
         self._pos += self.batch_size
+        if self.labels is not None:
+            self.last_labels = self.labels[idx]
         return self.images[idx].float() / 127.5 - 1.0  # [-1, 1], as in dataset.py
+
+    def sample_labels(self, n):
+        """Labels of n random training slices, so generated classes follow the training mix."""
+        return self.labels[torch.randint(len(self.labels), (n,), device=self.labels.device, generator=self.gen)]
 
 
 def load_training_images(dataset, resolution, cache_dir, num_workers):
+    """Training images, and their class labels for ADNI (None for OASIS, which is unlabelled here)."""
     if dataset == "adni":
-        return get_adni_splits(resolution=resolution, cache_dir=cache_dir, num_workers=num_workers)["train"].images
-    return OASISSlices(resolution=resolution, cache_dir=cache_dir, num_workers=num_workers).images
+        train = get_adni_splits(resolution=resolution, cache_dir=cache_dir, num_workers=num_workers)["train"]
+        return train.images, train.labels
+    return OASISSlices(resolution=resolution, cache_dir=cache_dir, num_workers=num_workers).images, None
 
 
 # --------------------------------------------------------------------------- #
 # Logging helpers
 # --------------------------------------------------------------------------- #
-def save_samples(generator, z, path):
+def save_samples(generator, z, path, c=None):
     """Save a grid of generated images (torchvision handles the tiling)."""
     was_training = generator.training
     generator.eval()
     with torch.no_grad():
-        save_image(generator(z), path, nrow=8, normalize=True, value_range=(-1, 1))
+        images = generator(z) if c is None else generator(z, c)
+        save_image(images, path, nrow=8, normalize=True, value_range=(-1, 1))
     generator.train(was_training)
 
 
@@ -229,10 +247,14 @@ def stylegan2_settings(args):
 
 
 def train_stylegan2(args, batches, device, run_dir):
+    c_dim = 2 if args.conditional else 0
     G = StyleGAN2Generator(args.resolution, z_dim=args.latent_dim, channel_base=args.channel_base,
-                           max_channels=args.max_channels).to(device)
+                           max_channels=args.max_channels, c_dim=c_dim).to(device)
     D = StyleGAN2Discriminator(args.resolution, channel_base=args.channel_base,
-                               max_channels=args.max_channels).to(device)
+                               max_channels=args.max_channels, c_dim=c_dim).to(device)
+
+    def onehot(labels):
+        return F.one_hot(labels, 2).float() if c_dim else None
     G_ema = copy.deepcopy(G).eval().requires_grad_(False)
     gamma, ema_beta = stylegan2_settings(args)
     # Lazy regularisation: the R1 step runs every r1_every iterations, so the optimiser's
@@ -242,6 +264,7 @@ def train_stylegan2(args, batches, device, run_dir):
     d_opt = optim.Adam(D.parameters(), lr=args.lr * c, betas=(0.0, 0.99 ** c))
     fixed_z = torch.randn(64, args.latent_dim, device=device,
                           generator=torch.Generator(device=device).manual_seed(args.seed))
+    fixed_c = onehot(torch.arange(64, device=device) // 32)  # rows 0-3 CN, rows 4-7 AD
     aug = None
     if args.ada or args.aug_p is not None:
         aug = AdaptiveAugment(target=args.ada_target, ada_kimg=args.ada_kimg, fixed_p=args.aug_p).to(device)
@@ -286,8 +309,10 @@ def train_stylegan2(args, batches, device, run_dir):
         # Discriminator step: logistic loss on a real and a generated batch.
         z = torch.randn(real.size(0), args.latent_dim, device=device)
         with torch.no_grad():
-            fake = G(z)
-        real_scores, fake_scores = D(A(real)), D(A(fake))
+            c_fake = onehot(batches.sample_labels(real.size(0))) if c_dim else None
+            fake = G(z, c_fake)
+        c_real = onehot(batches.last_labels) if c_dim else None
+        real_scores, fake_scores = D(A(real), c_real), D(A(fake), c_fake)
         d_loss = d_logistic_loss(real_scores, fake_scores)
         d_opt.zero_grad(set_to_none=True)
         d_loss.backward()
@@ -299,7 +324,7 @@ def train_stylegan2(args, batches, device, run_dir):
 
         # Lazy R1 on real images, scaled by the interval so its average weight is gamma / 2.
         if it % args.r1_every == 0:
-            r1 = r1_penalty(D, A(real).detach())
+            r1 = r1_penalty(D, A(real).detach(), c_real)
             d_opt.zero_grad(set_to_none=True)
             (gamma / 2 * r1 * args.r1_every).backward()
             d_opt.step()
@@ -307,7 +332,8 @@ def train_stylegan2(args, batches, device, run_dir):
 
         # Generator step: non-saturating loss; also updates the running average of w.
         z = torch.randn(real.size(0), args.latent_dim, device=device)
-        g_loss = g_nonsaturating_loss(D(A(G(z, track_w_avg=True))))
+        c_gen = onehot(batches.sample_labels(real.size(0))) if c_dim else None
+        g_loss = g_nonsaturating_loss(D(A(G(z, c_gen, track_w_avg=True)), c_gen))
         g_opt.zero_grad(set_to_none=True)
         g_loss.backward()
         g_opt.step()
@@ -348,7 +374,7 @@ def train_stylegan2(args, batches, device, run_dir):
             t_log = time.time()
 
         if it % args.sample_every == 0 or it == args.iters:
-            save_samples(G_ema, fixed_z, os.path.join(run_dir, "samples", f"iter_{it:06d}.png"))
+            save_samples(G_ema, fixed_z, os.path.join(run_dir, "samples", f"iter_{it:06d}.png"), fixed_c)
         if it % args.snapshot_every == 0 or it == args.iters:
             torch.save(G_ema.state_dict(), os.path.join(run_dir, "snapshots", f"generator_{it:06d}.pt"))
         if it % args.checkpoint_every == 0 or it == args.iters:
@@ -360,7 +386,7 @@ def train_stylegan2(args, batches, device, run_dir):
             with open(os.path.join(run_dir, "history.json"), "w") as f:
                 json.dump(history, f)
 
-    save_samples(G_ema, torch.randn(64, args.latent_dim, device=device),
+    save_samples(G_ema, torch.randn(64, args.latent_dim, device=device), c=fixed_c, path=
                  os.path.join(run_dir, "random_samples_final.png"))
     return dict(generator_params=count_parameters(G), discriminator_params=count_parameters(D),
                 final_ada_p=float(aug.p) if aug is not None else None,
@@ -391,6 +417,8 @@ def main():
     p.add_argument("--ada_target", type=float, default=0.6, help="stylegan2 ADA: target E[sign(D(real))]")
     p.add_argument("--ada_interval", type=int, default=4, help="stylegan2 ADA: iterations between p updates")
     p.add_argument("--ada_kimg", type=float, default=500, help="stylegan2 ADA: kimg for p to change by 1")
+    p.add_argument("--conditional", action="store_true",
+                   help="stylegan2 on adni: condition both networks on the diagnosis (CN / AD)")
     p.add_argument("--aug_p", type=float, default=None,
                    help="stylegan2: augment with this fixed probability instead of adapting it (no --ada needed)")
     p.add_argument("--log_every", type=int, default=100)
@@ -403,6 +431,8 @@ def main():
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--out_root", default=os.path.join(here, "outputs", "runs"))
     args = p.parse_args()
+    if args.conditional and (args.model != "stylegan2" or args.dataset != "adni"):
+        raise SystemExit("--conditional needs --model stylegan2 and --dataset adni (class labels)")
     for k, v in MODEL_DEFAULTS[args.model].items():
         if getattr(args, k) is None:
             setattr(args, k, v)
@@ -421,8 +451,8 @@ def main():
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"Run directory: {run_dir}")
 
-    images = load_training_images(args.dataset, args.resolution, args.cache_dir, args.num_workers)
-    batches = GPUBatches(images, args.batch_size, device, args.seed)
+    images, labels = load_training_images(args.dataset, args.resolution, args.cache_dir, args.num_workers)
+    batches = GPUBatches(images, args.batch_size, device, args.seed, labels=labels if args.conditional else None)
     print(f"{args.dataset}: {len(images)} training slices at {args.resolution} px, "
           f"{len(images) // args.batch_size} iterations per epoch")
 
