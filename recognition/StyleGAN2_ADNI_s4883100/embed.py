@@ -15,7 +15,8 @@ assigned the majority class of its 10 nearest real test slices in Inception spac
 the share of the generated cohort that looks AD-like. The same vote applied to real
 validation slices (whose labels are known) shows how much class information these
 features carry at all; if that accuracy is near chance, the generated class shares mean
-little.
+little. For a class-conditional run, the vote is reported separately for CN-labelled and
+AD-labelled slices, and its panel colours generated slices by their requested class.
 
 Usage (GPU job on Rangpur, see embed.sh):
     python embed.py --runs wgan_adni64:10000 sg2_adni64:10000
@@ -31,7 +32,8 @@ import numpy as np
 import torch
 
 from dataset import CLASS_NAMES, DEFAULT_CACHE, DEFAULT_SEED, get_adni_splits
-from predict import build_generator, generate, inception_features, inception_model, load_run, snapshot_iter
+from predict import (build_generator, class_labels, generate, inception_features, inception_model, load_run,
+                     snapshot_iter)
 
 
 def knn_vote(query, ref, ref_labels, k=10, device="cpu", chunk=1024):
@@ -59,7 +61,7 @@ def embed(features, seed, perplexity):
                 random_state=seed).fit_transform(x)
 
 
-def plot(xy, groups, real_labels, real_pos, runs, path, title):
+def plot(xy, groups, real_labels, real_pos, runs, path, gen_labels, title):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -89,7 +91,14 @@ def plot(xy, groups, real_labels, real_pos, runs, path, title):
         ax = axes[1 + i]
         ax.scatter(xy[real, 0], xy[real, 1], c="#BBBBBB", label="real test", alpha=0.5, **kw)
         g = groups == i
-        ax.scatter(xy[g, 0], xy[g, 1], c="#DD8452", label="generated", alpha=0.6, **kw)
+        if gen_labels[i - 1] is None:
+            ax.scatter(xy[g, 0], xy[g, 1], c="#DD8452", label="generated", alpha=0.6, **kw)
+        else:
+            lab = gen_labels[i - 1].numpy()
+            pts = xy[g]
+            for c, colour in zip((0, 1), ("#4C72B0", "#C44E52")):
+                ax.scatter(pts[lab == c, 0], pts[lab == c, 1], c=colour, label=f"generated {CLASS_NAMES[c]}",
+                           alpha=0.6, **kw)
         ax.set_title(name)
         ax.legend(markerscale=4, fontsize=8)
 
@@ -124,7 +133,7 @@ def main():
     t0 = time.time()
     inception = inception_model(device)
 
-    runs, gen_feats, resolution = [], [], None
+    specs, resolution = [], None
     for spec in args.runs:
         name, _, it = spec.partition(":")
         config, snaps = load_run(os.path.join(args.runs_root, name))
@@ -135,15 +144,21 @@ def main():
         if resolution not in (None, config["resolution"]):
             raise SystemExit("all runs must share one resolution")
         resolution = config["resolution"]
-        generator = build_generator(config, device)
-        generator.load_state_dict(torch.load(snaps[-1], map_location=device))
-        images = generate(generator, args.n_generated, config["latent_dim"], device, args.seed)
-        gen_feats.append(inception_features(inception, images, device))
-        runs.append((f"{name}, iteration {snapshot_iter(snaps[-1])}", name))
-        print(f"{runs[-1][0]}: {args.n_generated} slices generated")
+        specs.append((name, config, snaps[-1]))
 
     splits = get_adni_splits(resolution=resolution, seed=DEFAULT_SEED, cache_dir=args.cache_dir,
                              num_workers=args.num_workers)
+    runs, gen_feats, gen_labels = [], [], []
+    for name, config, snap in specs:
+        generator = build_generator(config, device)
+        generator.load_state_dict(torch.load(snap, map_location=device))
+        labels = class_labels(config, args.n_generated, splits["train"].labels, args.seed)
+        images = generate(generator, args.n_generated, config["latent_dim"], device, args.seed, labels=labels)
+        gen_feats.append(inception_features(inception, images, device))
+        gen_labels.append(labels)
+        runs.append((f"{name}, iteration {snapshot_iter(snap)}", name))
+        print(f"{runs[-1][0]}: {args.n_generated} slices generated" + (" (class-conditional)" if labels is not None else ""))
+
     test, val = splits["test"], splits["val"]
     test_feats = inception_features(inception, test.images, device)
     val_feats = inception_features(inception, val.images, device)
@@ -157,10 +172,15 @@ def main():
           f"AD share predicted {float(val_pred.float().mean()):.1%}, true {float(val.labels.float().mean()):.1%}")
     print(f"  real test slices: AD share {real_ad:.1%}")
     class_shares = {}
-    for (label, _), f in zip(runs, gen_feats):
-        share = float(knn_vote(f, test_feats, test.labels, args.k, device).float().mean())
-        class_shares[label] = share
-        print(f"  {label}: AD-like share {share:.1%}")
+    for (label, _), f, lab in zip(runs, gen_feats, gen_labels):
+        votes = knn_vote(f, test_feats, test.labels, args.k, device)
+        class_shares[label] = float(votes.float().mean())
+        print(f"  {label}: AD-like share {class_shares[label]:.1%}")
+        if lab is not None:
+            for c in (0, 1):
+                share = float(votes[lab == c].float().mean())
+                class_shares[f"{label}, {CLASS_NAMES[c]}-labelled"] = share
+                print(f"    {CLASS_NAMES[c]}-labelled slices: AD-like share {share:.1%}")
 
     feats = torch.cat([test_feats] + gen_feats)
     groups = np.concatenate([np.zeros(len(test_feats), int)] + [np.full(len(f), i + 1) for i, f in enumerate(gen_feats)])
@@ -170,7 +190,7 @@ def main():
     os.makedirs(args.fig_dir, exist_ok=True)
     os.makedirs(args.out_root, exist_ok=True)
     path = os.path.join(args.fig_dir, f"{args.tag}.png")
-    plot(xy, groups, test.labels.numpy(), test.slice_pos.numpy(), runs, path,
+    plot(xy, groups, test.labels.numpy(), test.slice_pos.numpy(), runs, path, gen_labels,
          f"t-SNE of Inception features: {len(test)} real test slices and {args.n_generated} generated per run "
          f"(local neighbourhoods are meaningful; distances between clusters are not)")
     with open(os.path.join(args.out_root, f"{args.tag}.json"), "w") as f:

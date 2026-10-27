@@ -52,6 +52,9 @@ generated slices are distributed like real ones); coverage is the share of real 
 whose ball contains at least one generated slice, the more robust measure of how much of
 the real variety the generator reproduces.
 
+Coverage is also reported per real class (CN, AD), and for a class-conditional run per
+generated class, to show whether the AD-labelled slices reproduce real AD anatomy.
+
 Trade-off figure: FID and coverage against the masked flag rate for every evaluated
 snapshot, with the real-vs-real reference marked; --compare adds other runs' saved
 results (e.g. the baseline) to the same axes.
@@ -84,6 +87,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from audit import SSIMIndex, _join
 from dataset import DEFAULT_CACHE, get_adni_splits
@@ -112,20 +116,37 @@ def build_generator(config, device):
         return WGANGenerator(config["latent_dim"], config["resolution"]).to(device)
     if config["model"] == "stylegan2":  # snapshots hold the EMA generator; sampled without truncation
         return StyleGAN2Generator(config["resolution"], z_dim=config["latent_dim"],
-                                  channel_base=config["channel_base"], max_channels=config["max_channels"]).to(device)
+                                  channel_base=config["channel_base"], max_channels=config["max_channels"],
+                                  c_dim=2 if config.get("conditional") else 0).to(device)
     raise ValueError(f"Unknown model {config['model']}")
 
 
 @torch.no_grad()
-def generate(generator, n, latent_dim, device, seed, batch=500):
-    """n generated slices as uint8 (n, 1, R, R), quantised the same way as the real data."""
+def class_labels(config, n, train_labels, seed):
+    """For a class-conditional run: n labels (0 = CN, 1 = AD) in the training slices' class mix
+    (deterministic counts, shuffled with the seed). None for unconditional runs."""
+    if not config.get("conditional"):
+        return None
+    n_ad = round(n * float(train_labels.float().mean()))
+    labels = torch.cat([torch.zeros(n - n_ad, dtype=torch.long), torch.ones(n_ad, dtype=torch.long)])
+    return labels[torch.randperm(n, generator=torch.Generator().manual_seed(seed))]
+
+
+def generate(generator, n, latent_dim, device, seed, batch=500, labels=None):
+    """n generated slices as uint8 (n, 1, R, R), quantised the same way as the real data.
+
+    labels: class per slice for a class-conditional generator (from class_labels)."""
     generator.eval()
     torch.manual_seed(seed)  # StyleGAN2's per-pixel noise uses the global generator
     g = torch.Generator(device=device).manual_seed(seed)
     out = []
     for s in range(0, n, batch):
         z = torch.randn(min(batch, n - s), latent_dim, device=device, generator=g)
-        x = generator(z).clamp(-1, 1)
+        if labels is None:
+            x = generator(z)
+        else:
+            x = generator(z, F.one_hot(labels[s:s + len(z)].to(device), 2).float())
+        x = x.clamp(-1, 1)
         out.append(((x + 1) * 127.5).round().to(torch.uint8))
     return torch.cat(out)
 
@@ -373,11 +394,28 @@ def density_coverage(real, fake, k=5, device="cpu"):
     return float(inside.sum() / (k * len(fake))), float(inside.any(dim=0).float().mean())
 
 
-def fidelity(feats, test_feats, device):
+def class_coverage(test_feats, test_labels, feats, labels=None, k=5, device="cpu"):
+    """Coverage per real class: the share of real test slices of each class whose k-NN ball
+    contains at least one generated slice. With labels for the generated slices, also the
+    coverage of each real class by each generated class alone."""
+    real, fake = test_feats.float().to(device), feats.float().to(device)
+    inside = (torch.cdist(fake, real) <= knn_radii(real, k)[None, :]).cpu()  # (generated, real)
+    out = {"all": [float(inside[:, test_labels == c].any(dim=0).float().mean()) for c in (0, 1)]}
+    if labels is not None:
+        for g in (0, 1):
+            out[f"generated class {g}"] = [float(inside[labels == g][:, test_labels == c].any(dim=0).float().mean())
+                                           if (labels == g).any() else float("nan") for c in (0, 1)]
+    return out
+
+
+def fidelity(feats, test_feats, device, test_labels=None, labels=None):
     p, r = precision_recall(test_feats, feats, device=device)
     dens, cov = density_coverage(test_feats, feats, device=device)
-    return dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, density=dens, coverage=cov,
-                n=len(feats), n_test=len(test_feats))
+    out = dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, density=dens, coverage=cov,
+               n=len(feats), n_test=len(test_feats))
+    if test_labels is not None:
+        out["class_coverage"] = class_coverage(test_feats, test_labels, feats, labels, device=device)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -528,7 +566,8 @@ def main():
     if not args.no_fidelity:
         inception = inception_model(device)
         test_feats = inception_features(inception, test_split.images, device)
-        fid_ref = fidelity(inception_features(inception, val.images, device), test_feats, device)
+        fid_ref = fidelity(inception_features(inception, val.images, device), test_feats, device,
+                           test_split.labels, val.labels)
         print(f"Fidelity reference (real validation vs real test slices): FID {fid_ref['fid']:.2f}, "
               f"precision {fid_ref['precision']:.3f}, recall {fid_ref['recall']:.3f}")
     joint = _join(refs, SSIMIndex(test_split.images, device, calib["brain_threshold"]))
@@ -550,7 +589,8 @@ def main():
     for path in chosen:
         it = snapshot_iter(path)
         generator.load_state_dict(torch.load(path, map_location=device))
-        gen = generate(generator, args.n_samples, config["latent_dim"], device, args.seed)
+        gen_labels = class_labels(config, args.n_samples, train.labels, args.seed)
+        gen = generate(generator, args.n_samples, config["latent_dim"], device, args.seed, labels=gen_labels)
         t0 = time.time()
         res = audit_generated(gen, train_index, device, calib["brain_threshold"])
         s = summarise(res, ref, args.n_samples)
@@ -560,7 +600,8 @@ def main():
         del joint
         gaps[it] = gap
         excess = paired_excess(gap, test_gap, test_split.subject_idx, seed=args.seed)
-        fid_res = None if args.no_fidelity else fidelity(inception_features(inception, gen, device), test_feats, device)
+        fid_res = None if args.no_fidelity else fidelity(inception_features(inception, gen, device), test_feats,
+                                                         device, test_split.labels, gen_labels)
         results[it] = dict(s, checks=checks, matched_reference=strip_per_query(gap), paired_excess=excess,
                            fidelity=fid_res, search_seconds=round(time.time() - t0, 1))
         for metric in ("whole", "masked"):
@@ -586,7 +627,8 @@ def main():
             if it_o not in gaps:
                 continue
             o_gen.load_state_dict(torch.load(path, map_location=device))
-            o_imgs = generate(o_gen, args.n_samples, o_config["latent_dim"], device, args.seed)
+            o_imgs = generate(o_gen, args.n_samples, o_config["latent_dim"], device, args.seed,
+                              labels=class_labels(o_config, args.n_samples, train.labels, args.seed))
             joint = _join(refs, SSIMIndex(o_imgs, device, calib["brain_threshold"]))
             o_gap = reference_gap(joint, torch.arange(refs.n, joint.n, device=device), subsets, val_cand)
             del joint
@@ -603,6 +645,17 @@ def main():
                   + (f"   <- real-vs-real reference ({f['n']} validation slices)" if name == "real val" else ""))
         print("(lower FID = closer distribution; precision and density = realism; recall and coverage = how much "
               "of the real data's variety is reproduced)")
+
+        print("\nCoverage by real class (share of real test slices with a generated slice in their neighbourhood)")
+        print(f"{'set':>14} {'by':<22} {'real CN':>8} {'real AD':>8}")
+        for name, f in rows:
+            for by, (cn, ad) in f["class_coverage"].items():
+                by_label = {"all": "all slices", "generated class 0": "CN-labelled slices",
+                            "generated class 1": "AD-labelled slices"}[by]
+                if name == "real val" and by != "all":
+                    by_label = by_label.replace("labelled", "validation")
+                print(f"{name:>14} {by_label:<22} {cn:>8.3f} {ad:>8.3f}")
+        print("(for a conditional run, the class rows show whether AD-labelled slices cover real AD slices)")
 
     print("\nMatched-reference test: nearest SSIM to training subsets vs to the validation split "
           "(equal patients and slices)")
