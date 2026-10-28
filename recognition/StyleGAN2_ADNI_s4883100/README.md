@@ -420,6 +420,7 @@ sbatch classify.sh --runs wgan_adni64:10000 sg2_adni64:10000 sg2_adni64_augp02:1
 ```
 
 **Outputs.** Training writes to `outputs/runs/<run_name>/` (config, loss history and curves, fixed-noise sample grids, generator snapshots every 2,500 iterations, a resumable checkpoint). Evaluation writes JSON results to `outputs/eval/<run_name>/` and figures to `figures/`. `outputs/` is gitignored; no weights or data are committed.
+`figures/` also contains per-run diagnostics not shown here (loss curves, trade-off plots, audit histograms and nearest-neighbour grids for every run), produced by the commands above.
 
 **Example input and output.** The input to a trained generator is a random latent vector; the output is a 64 × 64 greyscale slice in [−1, 1]. `predict.py` loads a snapshot, generates 3,100 slices and prints tables such as:
 
@@ -772,7 +773,7 @@ All on one NVIDIA A100-PCIE-40GB. The whole project used about 24 A100-hours acr
 - **Checkpoint selection on test data.** Checkpoints were compared on test-set metrics (FID and the matched-reference excess both use the test patients), so the chosen checkpoint's numbers are slightly optimistic. A held-out selection split would remove this bias.
 - **Class information.** Inception-v3 features and pixel SSIM are both nearly blind to AD-specific anatomy. The dedicated classifier is better (0.78 test balanced accuracy, also within single slice levels) but moderate and partly level-sensitive, and on generated slices its absolute AD share is affected by the shift away from real data, so only within-model comparisons (conditional label fidelity) are interpreted.
 - **Validation sample size.** The audit threshold rests on 68 validation patients and the matched-reference control on 68 test patients, which is why single-run excess intervals are wide; direct model comparisons avoid this.
-- **Future work:** a stronger, level-matched AD/CN classifier (e.g. trained only on slice indices shared by both classes); wider high-resolution layers and longer training at 128 px; a feature-space identity audit; more seeds per configuration; a held-out split for checkpoint selection.
+- **Future work:** AD-balanced or AD-oversampled conditional training to widen AD coverage, audited per class, since showing each of the 177 AD training patients more often is exactly the condition under which memorisation of minority-class patients should rise; a stronger, level-matched AD/CN classifier (e.g. trained only on slice indices shared by both classes); conditioning on slice level as well as class, to separate disease anatomy from level (Discovery 9); wider high-resolution layers and longer training at 128 px; a feature-space identity audit; more seeds per configuration; a held-out split for checkpoint selection.
 
 ## 12. Artificial Intelligence Usage Disclosure
 
