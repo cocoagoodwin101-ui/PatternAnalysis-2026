@@ -26,11 +26,11 @@ Generating realistic, non-memorised brain MRI slices from the ADNI dataset with 
 
 Medical imaging research is constrained by patient privacy law and limited scan availability. Synthetic cohorts produced by generative models could be shared and used for augmentation, but only if they are anatomically plausible **and** do not reproduce real patients. This project trains StyleGAN2 on cognitively normal (CN) and Alzheimer's disease (AD) brain MRI slices from ADNI, compares it against a WGAN-GP baseline, and audits whether generated brains are genuinely novel or memorised copies of training patients.
 
-**How it works.** StyleGAN2 (Karras et al., 2020) generates an image in two stages. A mapping network of 8 fully connected layers turns a random latent vector *z* into a style vector *w*. A synthesis network then starts from a learned 4 × 4 constant and doubles the resolution up to 64 × 64; at every layer, *w* modulates the convolution weights (scaling them per input channel, then renormalising them, "demodulation"), and per-pixel noise adds fine stochastic detail. A residual discriminator, with a minibatch standard-deviation feature that exposes a lack of variety, scores images as real or generated. Training uses the non-saturating logistic loss with R1 regularisation, and samples come from an exponential moving average of the generator's weights. The baseline is my Lab 2 WGAN-GP: a DCGAN-style generator and critic trained with the Wasserstein loss and a gradient penalty. Every model is then measured three ways: **fidelity** (FID, precision, density and coverage against held-out patients), **memorisation** (the calibrated audit of Section 7, plus a matched-reference test that separates training-specific resemblance from general realism), and **class coverage** (a joint t-SNE embedding).
+**How it works.** StyleGAN2 (Karras et al., 2020) generates an image in two stages. A mapping network of 8 fully connected layers turns a random latent vector *z* into a style vector *w*. A synthesis network then starts from a learned 4 × 4 constant and doubles the resolution up to 64 × 64; at every layer, *w* modulates the convolution weights (scaling them per input channel, then renormalising them, "demodulation"), and per-pixel noise adds fine stochastic detail. A residual discriminator, with a minibatch standard-deviation feature that exposes a lack of variety, scores images as real or generated. Training uses the non-saturating logistic loss with R1 regularisation (Mescheder et al., 2018), and samples come from an exponential moving average of the generator's weights. The baseline is my Lab 2 WGAN-GP: a DCGAN-style generator and critic trained with the Wasserstein loss and a gradient penalty. Every model is then measured three ways: **fidelity** (FID, precision, density and coverage against held-out patients), **memorisation** (the calibrated audit of Section 7, plus a matched-reference test that separates training-specific resemblance from general realism), and **class fidelity and coverage** (a joint t-SNE embedding and a dedicated AD/CN classifier).
 
-| WGAN-GP baseline | StyleGAN2 (10,000 iterations, uncurated) |
+| WGAN-GP baseline | StyleGAN2, recommended configuration (augmentation p = 0.2, 17,500 iterations, uncurated) |
 |---|---|
-| ![Baseline samples](figures/wgan_adni64_random_samples.png) | ![StyleGAN2 samples](figures/sg2_adni64_iter010000_uncurated_seed1.png) |
+| ![Baseline samples](figures/wgan_adni64_random_samples.png) | ![StyleGAN2 samples](figures/sg2_adni64_augp02_iter017500_uncurated_seed1.png) |
 
 *Uncurated generated ADNI slices at 64 × 64. StyleGAN2 produces sharper cortical folds, cleaner outlines and a wider range of head positions.*
 
@@ -247,15 +247,15 @@ Stratification balances patients, not slices. Because AD patients have between 1
 | Split | Patient-level, label-stratified, 80/10/10, fixed seed | Removes the leakage in the provided split (Section 4) |
 | Privacy | No patient IDs or split files committed | ADNI data use terms |
 | Memorisation audit | Nearest-neighbour masked SSIM to the training set, with per-class thresholds calibrated on validation patients and checked on test patients | Calibrated on real data instead of an arbitrary cutoff; the originally planned same-person threshold proved invalid (Section 7.1) |
-| Code organisation | `modules.py`, `dataset.py`, `train.py`, `predict.py`, plus `audit.py` and `data_audit.py` | Required structure; model code depends only on PyTorch |
+| Code organisation | `modules.py`, `dataset.py`, `train.py`, `predict.py`, plus `audit.py`, `data_audit.py` and the analysis scripts `embed.py`, `autopsy.py`, `latent.py` and `classify.py` | Required structure; model code depends only on PyTorch |
 | Brain crop | None (padding only) | Measured: a crop containing every brain is the full frame (Discovery 10) |
 | Scan quality filter | Exclude scans with mean intensity < 0.5 × median, after the patient split | Removes the two corrupted scans with a relative rule rather than hard-coded IDs, without altering the split (Discovery 11) |
 | Simplified resampling and width | Bilinear upsampling and average pooling instead of transposed convolutions with FIR blur; channels capped at 256 | Simpler code that fits the budget; the OASIS check confirmed the implementation produces sharp, varied brains |
 | Training length | 15,100 iterations (966 thousand real images shown) for every model | Equal real-image budget for a like-for-like comparison, matching the verified Lab 2 baseline run |
 | Checkpoint selection | Every 2,500-iteration snapshot audited; checkpoint chosen on fidelity and memorisation together | The baseline already showed memorisation rising with training, so the final snapshot is not automatically the best |
 | Discriminator augmentation | Translation, isotropic scaling, rotation, brightness, contrast; no flips or colour. Applied adaptively (ADA) or with a fixed probability p = 0.2 | A mirrored sagittal slice is anatomically wrong, and the data is greyscale. The fixed-probability option tests augmentation directly, since ADA's standard trigger never activated on this dataset (Section 11.5) |
-| Evaluation features | Inception-v3 (standard FID weights) for FID, precision/recall, density/coverage and t-SNE | Standard and comparable across runs; its weak sensitivity to AD-specific anatomy is reported as a limitation (Section 11.6) |
-| Class conditioning | Optional: one-hot class embedded in the mapping network; projection discriminator (Miyato and Koyama, 2018) | Follows StyleGAN2-ADA; tested because unconditional generation under-represents AD (Section 11.6). Off by default, so unconditional snapshots still load |
+| Evaluation features | Inception-v3 (Szegedy et al., 2016; standard FID weights) for FID, precision/recall, density/coverage and t-SNE; a dedicated AD/CN CNN for class fidelity (`classify.py`) | Inception features are standard and comparable across runs but barely separate AD from CN (Section 11.6), so class fidelity is measured with a classifier trained on the real training split and checked against the slice-level confound (Discovery 9) |
+| Class conditioning | Optional: one-hot class embedded in the mapping network; projection discriminator (Miyato and Koyama, 2018) | Follows StyleGAN2-ADA; tested because unconditional generation covers real AD slices less well than CN slices (Section 11.6). Off by default, so unconditional snapshots still load |
 | Replication | A second training seed for the recommended configuration | Separates a real effect from run-to-run variation, the main weakness of single runs |
 | Latent-space analysis | Interpolation with nearest-neighbour tracking, and an inversion-based membership test (`latent.py`) | The specification asks for latent interpolation between synthetic images and training scans; inversion tests what the generator *can* produce, not only what it samples (Section 11.8) |
 ---
@@ -411,6 +411,12 @@ sbatch embed.sh --runs sg2_adni64:10000 sg2_adni64_cond:10000 --tag embedding_ts
 sbatch autopsy.sh --run_name sg2_adni64 --iter 10000 --copy_iter 12500
 sbatch latent.sh --run_name sg2_adni64 --iter 10000
 sbatch latent.sh --run_name wgan_adni64 --iter 10000
+sbatch autopsy.sh --run_name sg2_adni64_augp02 --iter 17500 --copy_iter 20000   # recommended checkpoint
+sbatch latent.sh --run_name sg2_adni64_augp02 --iter 17500
+
+# 6. Class fidelity: train the AD/CN classifier (about 1 min) and classify generated cohorts
+sbatch classify.sh --runs wgan_adni64:10000 sg2_adni64:10000 sg2_adni64_augp02:17500 sg2_adni64_cond:15100
+# add --eval_only to reuse the saved classifier
 ```
 
 **Outputs.** Training writes to `outputs/runs/<run_name>/` (config, loss history and curves, fixed-noise sample grids, generator snapshots every 2,500 iterations, a resumable checkpoint). Evaluation writes JSON results to `outputs/eval/<run_name>/` and figures to `figures/`. `outputs/` is gitignored; no weights or data are committed.
@@ -458,10 +464,10 @@ Before ADNI, both models were trained on OASIS 64 × 64, where a known-good resu
 | StyleGAN2, 10,000 | 13.7 | 0.347 | 0.237 | 0.369 | 0.421 |
 | StyleGAN2, 15,100 | 12.6 | 0.285 | 0.341 | 0.259 | 0.387 |
 | Stronger R1, 15,100 | 12.0 | 0.280 | 0.426 | 0.272 | 0.392 |
-| ADA, 15,100 | 11.4 | 0.305 | 0.397 | 0.299 | 0.417 |
+| ADA (target 0.6), 15,100 | 11.4 | 0.305 | 0.397 | 0.299 | 0.417 |
 | *Real validation vs test (reference)* | *6.3* | *0.331* | *0.331* | *0.351* | *0.478* |
 
-FID compares Inception-v3 feature distributions (lower is better). Precision and density measure realism (generated slices that fall where real slices do); recall and coverage measure how much of the real variety is reproduced. The real-vs-real row is what a perfect generator would score at these sample sizes: 20 near-identical adjacent slices per scan keep all four neighbourhood metrics low even for real data, so values are judged against it.
+FID (Heusel et al., 2017) compares Inception-v3 feature distributions (lower is better); precision and recall follow Kynkäänniemi et al. (2019), density and coverage Naeem et al. (2020). Precision and density measure realism (generated slices that fall where real slices do); recall and coverage measure how much of the real variety is reproduced. The real-vs-real row is what a perfect generator would score at these sample sizes: 20 near-identical adjacent slices per scan keep all four neighbourhood metrics low even for real data, so values are judged against it.
 
 StyleGAN2 is about 4× better than the baseline on FID, and at 10,000 iterations its precision and density match real data and its coverage reaches 88% of the real reference (baseline: 17%). The baseline's recall (0.32) looked respectable but was inflated by off-manifold samples; coverage, which only uses real slices' neighbourhoods, exposed this. Differences between the three StyleGAN2 variants (about 1 FID point) are within what single runs can resolve. The spec's SSIM target (> 0.6) is met: the median nearest-neighbour SSIM of StyleGAN2 slices to real training slices is 0.80 over the whole image and 0.62 over the brain.
 
@@ -474,7 +480,7 @@ StyleGAN2 is about 4× better than the baseline on FID, and at 10,000 iterations
 | StyleGAN2, 10,000 | 5.61% | −0.0000 [−0.0084, +0.0078] | 0 | 0.788 |
 | StyleGAN2, 15,100 | 5.81% | +0.0040 [−0.0044, +0.0118] | 0 | 0.785 |
 | Stronger R1, 15,100 | 7.00% | +0.0063 [−0.0019, +0.0139] | 0 | 0.778 |
-| ADA, 15,100 | 5.19% | +0.0048 [−0.0035, +0.0124] | 0 | 0.784 |
+| ADA (target 0.6), 15,100 | 5.19% | +0.0048 [−0.0035, +0.0124] | 0 | 0.784 |
 | *Real unseen test patients* | *0.61%* | | | |
 
 Three findings:
@@ -558,13 +564,13 @@ Fixed p = 0.2's density is about twice the real level and its recall about half:
 
 ![t-SNE embedding](figures/embedding_tsne.png)
 
-*Joint t-SNE of Inception features: real test slices coloured by class and by slice position, then each model's generated slices over the real slices in grey. Local neighbourhoods are meaningful; distances between clusters are not.*
+*Joint t-SNE (van der Maaten and Hinton, 2008) of Inception features: real test slices coloured by class and by slice position, then each model's generated slices over the real slices in grey. Local neighbourhoods are meaningful; distances between clusters are not.*
 
 The real slices are organised mostly by slice position: the lateral ends of each scan's window cluster on the left and the middle positions on the right and bottom. AD slices concentrate in the upper-right region. The baseline's slices form a separate cluster barely overlapping the real data, consistent with its low precision and coverage. Both StyleGAN2 snapshots spread across the map and cover the full range of slice positions, but leave the AD-rich upper-right region largely uncovered.
 
-A 10-nearest-neighbour class vote in Inception space supports this, with a caveat. The features barely separate the classes (real validation slices: 56.4% balanced accuracy; predicted AD share 34.0% against a true 49.7%), so shares are indicative only. Against that 34% reference, generated cohorts look AD-like far less often: baseline 10.7%, StyleGAN2 13.4%, ADA at 15,100 iterations 19.1%. **Unconditional generation under-represents AD-typical anatomy.**
+A 10-nearest-neighbour class vote in Inception space was tried first. Its features barely separate the classes (real validation slices: 56.4% balanced accuracy), and it suggested generated cohorts look AD-like far less often than real slices (StyleGAN2 13.4% against 34.0%). The dedicated classifier at the end of this section, which separates the classes far better, does not confirm this, so the class-vote shares are not used as evidence.
 
-The failure autopsy measures this directly: 71.9% of real AD test slices have no generated slice in their Inception neighbourhood, against 47.0% of CN slices (Section 11.7).
+The failure autopsy measures the coverage gap directly: for default StyleGAN2 at 10,000 iterations, 71.9% of real AD test slices have no generated slice in their Inception neighbourhood, against 47.0% of CN slices; for the recommended configuration at 17,500 iterations, 65.7% against 41.3% (Section 11.7).
 
 **Coverage by class.** For every run, the share of real test slices of each class that some generated slice reaches (Inception neighbourhoods, k = 5):
 
@@ -576,13 +582,14 @@ The failure autopsy measures this directly: 71.9% of real AD test slices have no
 | Fixed p = 0.2 (seed 42), 15,100 | 0.617 | 0.329 | 82% |
 | Fixed p = 0.2 (seed 7), 15,100 | 0.590 | 0.320 | 80% |
 | Conditional, 15,100 | 0.496 | 0.275 | 68% |
+| Fixed p = 0.2 (seed 42), 17,500 (recommended) | 0.587 | 0.343 | 85% |
 | Fixed p = 0.2 (seed 42), 30,200 | 0.598 | 0.342 | 85% |
 | Conditional + fixed p = 0.2, 10,000 | 0.562 | 0.312 | 78% |
 | Conditional + fixed p = 0.2, 15,100 | 0.503 | 0.274 | 68% |
 
-**Class conditioning did not fix the AD gap.** The label has a small effect: AD-labelled slices reach real AD slices more often than CN-labelled ones (0.199 vs 0.179 at 15,100; 0.220 vs 0.172 at 10,000), and the class vote calls them AD-like more often (19.1% vs 11.8%). But AD-labelled slices still reach real CN slices more than real AD ones, overall AD coverage is unchanged (0.275), and in the embedding the AD-rich region stays largely empty. Likely reasons: AD's distinguishing anatomy (atrophy, enlarged ventricles) is subtle at 64 × 64, AD comes from fewer training patients (177 vs 365), and the class mostly shifts slice position (Discovery 9). **Augmentation improved AD coverage more than conditioning did.**
+**Class conditioning did not close the coverage gap.** In Inception space the label has a small effect: AD-labelled slices reach real AD slices more often than CN-labelled ones (0.199 vs 0.179 at 15,100; 0.220 vs 0.172 at 10,000). But AD-labelled slices still reach real CN slices more than real AD ones, overall AD coverage is unchanged (0.275), and in the embedding the AD-rich region stays largely empty. The dedicated classifier below shows that the label does strongly control class-visible features, so the problem is the range of AD anatomy reproduced, not whether the label is followed. Likely reasons: AD's distinguishing anatomy (atrophy, enlarged ventricles) is subtle at 64 × 64, AD comes from fewer training patients (177 vs 365), and the label partly shifts slice level (Discovery 9). **Augmentation improved AD coverage more than conditioning did.**
 
-**Combining conditioning with augmentation does not close the gap either.** It strengthens the label's effect (at 10,000 iterations AD-labelled slices reach 0.262 of real AD slices against 0.197 for CN-labelled ones, a wider gap than conditioning alone), but overall AD coverage at 15,100 iterations (0.274) is no better than conditioning alone and below augmentation alone (0.329). It does confirm the privacy effect a third time: its excess is significantly below the conditional-only run's from 10,000 iterations (at 15,100: −0.0041 [−0.0066, −0.0017]), indistinguishable from unconditional augmentation (−0.0009 [−0.0036, +0.0017]), and it produced no copy-level slices.
+**Combining conditioning with augmentation does not close the gap either.** In Inception space it strengthens the label's effect (at 10,000 iterations AD-labelled slices reach 0.262 of real AD slices against 0.197 for CN-labelled ones, a wider gap than conditioning alone), though the dedicated classifier separates its two labels slightly less well than conditioning alone (below), but overall AD coverage at 15,100 iterations (0.274) is no better than conditioning alone and below augmentation alone (0.329). It does confirm the privacy effect a third time: its excess is significantly below the conditional-only run's from 10,000 iterations (at 15,100: −0.0041 [−0.0066, −0.0017]), indistinguishable from unconditional augmentation (−0.0009 [−0.0036, +0.0017]), and it produced no copy-level slices.
 
 | Conditional | Conditional + fixed p = 0.2 |
 |---|---|
@@ -594,56 +601,103 @@ The failure autopsy measures this directly: 71.9% of real AD test slices have no
 
 *Joint t-SNE with the conditional run's slices coloured by requested class.*
 
+**Dedicated AD/CN classifier: class fidelity measured directly.** Because Inception features barely separate the classes, a small CNN (`classify.py`: four convolutional blocks, 1.17 M parameters) was trained on the real training slices with a class-weighted loss and light translation and intensity augmentation (no flips), selected on validation balanced accuracy (epoch 17 of 30; 67 s on one A100) and reported on test. Two checks guard against the slice-level confound of Discovery 9: a level-only predictor (the AD share of training slices at each absolute slice index), and the CNN's accuracy within single slice indices, where level cannot help.
+
+| Real slices | Validation | Test |
+|---|---:|---:|
+| CNN balanced accuracy / AUROC | 0.687 / 0.759 | 0.783 / 0.863 |
+| Level-only balanced accuracy / AUROC | 0.661 / 0.702 | 0.636 / 0.667 |
+| CNN balanced accuracy within a single slice index | | median 0.783 (0.693–0.864, 30 indices) |
+| Inception 10-NN class vote, balanced accuracy | 0.564 | |
+
+The classifier reads disease-related anatomy, not only slice level: with level held fixed it still reaches 0.78 on test. It is a moderate classifier, though: on validation it beats the level-only predictor only narrowly, the gap between validation and test reflects only 68 patients per split, and its training loss fell to about 0.01, so it overfits (selection on validation limits the damage).
+
+**Unconditional cohorts: no shortage of AD-classified slices.** A generator that reproduced the training class mix (49.3% AD) would be classified AD 44.5% of the time, given the classifier's test error rates (true-positive rate 0.732, false-positive rate 0.166); real test slices are classified AD 41.4% of the time (patient-bootstrap 95% interval 30.1–52.5%).
+
+| Cohort (3,100 slices), iteration | Classified AD (95% CI) | Label fidelity: AD-requested → AD / CN-requested → CN |
+|---|---|---|
+| *Real test slices* | *0.414 [0.301, 0.525]* | |
+| Baseline, 10,000 | 0.541 [0.523, 0.558] | |
+| StyleGAN2, 10,000 | 0.539 [0.521, 0.556] | |
+| StyleGAN2, 15,100 | 0.605 [0.588, 0.622] | |
+| ADA (target 0.4), 15,100 | 0.532 [0.514, 0.549] | |
+| Fixed p = 0.2, 17,500 (recommended) | 0.543 [0.525, 0.560] | |
+| Fixed p = 0.2, 30,200 | 0.486 [0.469, 0.504] | |
+| Fixed p = 0.2 (seed 7), 15,100 | 0.561 [0.544, 0.579] | |
+| Conditional, 15,100 | 0.557 [0.540, 0.575] | 0.955 / 0.829 |
+| Conditional + fixed p = 0.2, 10,000 | 0.543 [0.526, 0.561] | 0.857 / 0.762 |
+| Conditional + fixed p = 0.2, 15,100 | 0.528 [0.511, 0.546] | 0.886 / 0.819 |
+
+*Cohort intervals are Wilson intervals over slices and do not include the classifier's own uncertainty.*
+
+![AD/CN classifier](figures/classifier_adcn.png)
+
+*Left: the classifier's AD probability for real test slices and each generated cohort. Right: the share of each cohort classified AD, against real test slices (band) and the share expected for a faithful generator (dashed).*
+
+Three conclusions:
+
+1. **The Inception class vote was misleading.** Every generated cohort is classified AD at least as often as real slices (49–61% against 41%), so the earlier conclusion that unconditional generation produces too few AD-like slices does not hold. What the evidence supports is narrower: generators reach less of the *variety* of real AD anatomy (coverage, and the dropped-mode autopsy row), especially large, high-contrast AD slices.
+2. **The absolute AD share does not rank generators.** The baseline, whose slices barely overlap the real data (precision 0.056), is classified AD as often as StyleGAN2 (0.541 against 0.539). Generated slices are outside the data the classifier was trained on, and its output on them reflects that shift as much as class content, so differences between cohorts (e.g. 0.605 against 0.486) are not read as differences in class fidelity.
+3. **Conditioning works: the requested class is clearly visible.** Within each conditional run, which cancels most of that shared shift, 86–96% of AD-requested slices are classified AD and 76–83% of CN-requested slices CN, more separable than real AD and CN slices are to the same classifier (true-positive rate 0.73, true-negative rate 0.83). Some of this may be slice level, which the label also shifts (Discovery 9) and which the classifier partly uses; the two cannot be separated for generated slices. Adding augmentation slightly lowers the agreement (0.886 against 0.955 for AD-requested slices at 15,100).
+
 
 ### 11.7 Failure autopsy
 
-![Failure autopsy](figures/sg2_adni64_iter010000_autopsy.png)
+![Failure autopsy](figures/sg2_adni64_augp02_iter017500_autopsy.png)
 
-*Rule-selected failure cases from all 3,100 slices of the recommended snapshot (StyleGAN2, 10,000 iterations; the near-copy row uses 12,500, where the audit found a copy-level slice). Each pair shows the case and its nearest neighbour. Selected by `autopsy.py`, not by hand.*
+*Rule-selected failure cases from all 3,100 slices of the recommended snapshot (StyleGAN2 with fixed augmentation p = 0.2, 17,500 iterations; the near-copy row uses 20,000, where the audit found a copy-level slice). Each pair shows the case and its nearest neighbour. Selected by `autopsy.py`, not by hand. The same autopsy for default StyleGAN2 at 10,000 iterations is in `figures/sg2_adni64_iter010000_autopsy.png`.*
 
 To avoid cherry-picking, each row shows the top three slices under a fixed rule, and every generated case appears beside its nearest training slice, so the figure is also a memorisation check.
 
 | Rule | What the cases show | Likely cause | Memorised? |
 |---|---|---|---|
-| **Near-copy** (highest masked SSIM to training) | The top case (0.808) matches its training neighbour in outline, head tilt, ventricle shape and the white-matter band into the temporal lobe; only fine folds differ. It resembles a neighbouring slice of the same patient. The next two (0.769, 0.768) share the head position but differ in folds and size | Late-training drift towards training patients (Section 11.4); isolated: one slice in 3,100, none at 10,000 or 15,100 iterations | Borderline for the top case, which is just above the copy level of 0.796; the release filter (Section 11.12) removes such slices |
-| **Least like real** (lowest masked SSIM to any training slice, 0.345–0.349) | A very dim slice, a realistic slice with small bright specks, and a brain at the right edge of the frame | Rare modes of the training data (the nearest training slices are similarly dim or off-centre); the specks are a GAN artefact also seen in the baseline | No |
-| **Off-manifold** (farthest outside real slices' Inception neighbourhoods, 1.22–1.24 × radius) | Smudged, washed-out tissue with missing folds and the lower brain fading into the background; one over-bright white-matter band | Classic GAN texture failure: distorted tissue margins that Inception features detect | No (SSIM to training 0.42–0.63) |
-| **Dark** (lowest mean brain intensity, 42–45 of 255) | Dim, low-contrast slices | Faithful to dim but valid scans in the training data (Discovery 11), not a generator fault | No (0.40–0.44) |
-| **Dropped mode** (real AD test slices farthest from any generated slice, 1.61–1.71 × radius) | Large, high-contrast AD slices with enlarged ventricles and pronounced sulci; their nearest generated slices are smaller, lower in contrast, with narrower ventricles | The generator does not reproduce typical AD anatomy. 71.9% of real AD test slices have no generated slice in their neighbourhood, against 47.0% of CN slices. A plausible cause: AD slices come from fewer training patients (177 vs 365 CN, with more repeat scans), so AD anatomy is less varied in training than CN anatomy | Not applicable |
+| **Near-copy** (highest masked SSIM to training) | The top case (0.808) matches its training neighbour in outline, head tilt, ventricle curve and the white-matter band into the temporal lobe; only fine folds differ. The next two (0.770, 0.766) share the head position but differ in folds and outline | Slow late-training drift towards training patients (Section 11.5); isolated: one slice in 3,100, none at 17,500 iterations | Borderline for the top case, just above the copy level of 0.796; the release filter (Section 11.12) removes such slices |
+| **Least like real** (lowest masked SSIM to any training slice, 0.129–0.169) | An enlarged brain filling much of the frame with mottled bright tissue; a brain with a dark, broken lower half and bright specks; a stretched, elongated brain with smeared bright patches | Malformed anatomy, not rare-but-valid modes: these are much further from any real slice than default StyleGAN2's worst cases (0.345–0.349). The enlarged and stretched shapes are consistent with the scale and rotation augmentation occasionally leaking into the generator, a known risk of discriminator augmentation (Karras et al., 2020b), though p = 0.2 is well below where leaking is usually reported; this was not tested | No |
+| **Off-manifold** (farthest outside real slices' Inception neighbourhoods, 1.28–1.32 × radius) | Bright, washed-out tissue with stretched outlines; one twisted, compressed brain with smeared folds | GAN texture and shape failure, slightly further out than default StyleGAN2's (1.22–1.24 ×). Overall, fewer generated slices lie outside every real neighbourhood (30.5% against 43.1% for default StyleGAN2 at 10,000), consistent with its higher precision | No (SSIM to training 0.21–0.30) |
+| **Dark** (lowest mean brain intensity, 46–49 of 255) | Dim, low-contrast slices | Faithful to dim but valid scans in the training data (Discovery 11), not a generator fault | No (0.31–0.46) |
+| **Dropped mode** (real AD test slices farthest from any generated slice, 1.61–1.64 × radius) | Large, high-contrast AD slices with enlarged ventricles and pronounced sulci; their nearest generated slices are smaller and lower in contrast | The generator under-reproduces typical AD anatomy, as for every run. 65.7% of real AD test slices have no generated slice in their neighbourhood, against 41.3% of CN slices (default StyleGAN2 at 10,000: 71.9% and 47.0%). A plausible cause: AD slices come from fewer training patients (177 vs 365 CN, with more repeat scans) | Not applicable |
 
-![Uncurated samples](figures/sg2_adni64_iter010000_uncurated_seed1.png)
+**Recommended configuration versus default StyleGAN2.** Augmentation trades typical-case quality and coverage against rarer but worse outliers: it reaches more real slices of both classes and places fewer slices off the real manifold, but its worst slices are clearly malformed where default StyleGAN2's were merely unusual.
 
-*An uncurated 8 × 8 grid from the same snapshot (seed 1; a second seed is in `figures/sg2_adni64_iter010000_uncurated_seed2.png`). Most slices are realistic and varied; a few per grid are dim, as in the "dark" row. The autopsy cases are exceptions, not typical output.*
+| Uncurated, seed 1 | Uncurated, seed 2 |
+|---|---|
+| ![Uncurated seed 1](figures/sg2_adni64_augp02_iter017500_uncurated_seed1.png) | ![Uncurated seed 2](figures/sg2_adni64_augp02_iter017500_uncurated_seed2.png) |
 
-Two practical consequences: the release filter should also consider a minimum brain-intensity check if dim slices are unwanted downstream, and the dropped-mode row is the concrete form of the AD under-representation in Section 11.6.
+*Uncurated 8 × 8 grids from the recommended snapshot. Most slices are realistic and varied in size, position and contrast; a few per grid are dim, and about one per grid is visibly malformed (e.g. the smeared bright slice at the bottom right of seed 2). The autopsy cases are exceptions, not typical output.*
+
+Two practical consequences: the release filter should drop malformed slices as well as copies (Section 11.12), and the dropped-mode row is the concrete form of the AD coverage gap in Section 11.6.
 
 ### 11.8 Latent-space analysis
 
 **Interpolation.** For 40 pairs of latents, 9 frames each, every frame was matched to its nearest training slice (`latent.py`). StyleGAN2 interpolates linearly in its style space W; the baseline spherically in z.
 
-| 10,000 iterations | Paths reaching copy level | Different training neighbours per 9-frame path | Mid-path rise in similarity |
+| Run, iteration | Paths reaching copy level | Different training neighbours per 9-frame path | Mid-path rise in similarity |
 |---|---:|---:|---:|
-| Baseline | 0 / 40 | 7.2 | +0.035 |
-| StyleGAN2 | 0 / 40 | 7.9 | +0.073 |
+| Baseline, 10,000 | 0 / 40 | 7.2 | +0.035 |
+| StyleGAN2, 10,000 | 0 / 40 | 7.9 | +0.073 |
+| StyleGAN2 + fixed p = 0.2, 17,500 (recommended) | 0 / 40 | 7.7 | +0.075 |
 
-StyleGAN2 morphs smoothly, and each path passes near about eight different training slices, so it does not snap from one stored image to the next. The slight rise in similarity mid-path is the realism confound again (midpoints in W drift towards the average, most typical slice), not memorisation. In the "generated to training scan" row, the final frame is the inversion of that training slice, so its high similarity (0.84) is expected by construction.
+Both StyleGAN2 models morph smoothly, and each path passes near about eight different training slices, so they do not snap from one stored image to the next. The slight rise in similarity mid-path is the realism confound again (midpoints in W drift towards the average, most typical slice), not memorisation. In the "generated to training scan" row, the final frame is the inversion of that training slice, so its high similarity (0.84 for the recommended model) is expected by construction.
 
-![StyleGAN2 interpolation](figures/sg2_adni64_iter010000_interpolation.png)
+![Interpolation, recommended configuration](figures/sg2_adni64_augp02_iter017500_interpolation.png)
+
+*Interpolation for the recommended configuration. Default StyleGAN2's is in `figures/sg2_adni64_iter010000_interpolation.png`.*
 
 **Inversion membership test.** For one slice from each of 64 training patients and 64 unseen test patients, the latent that best reproduces the slice was found by gradient descent (500 steps). A generator that memorised its training patients would reproduce their slices better:
 
-| 10,000 iterations | Training patients | Unseen patients | Difference (95% CI) |
+| Run, iteration | Training patients | Unseen patients | Difference (95% CI) |
 |---|---:|---:|---|
-| Baseline | 0.797 | 0.775 | **+0.021 [+0.007, +0.035]** |
-| StyleGAN2 | 0.863 | 0.858 | +0.004 [−0.005, +0.015] |
+| Baseline, 10,000 | 0.797 | 0.775 | **+0.021 [+0.007, +0.035]** |
+| StyleGAN2, 10,000 | 0.863 | 0.858 | +0.004 [−0.005, +0.015] |
+| StyleGAN2 + fixed p = 0.2, 17,500 (recommended) | 0.845 | 0.841 | +0.004 [−0.007, +0.015] |
 
 *Reconstruction quality is masked SSIM between each slice and its inversion.*
 
-The baseline reproduces its training patients significantly better than unseen patients; StyleGAN2 shows no detectable difference, while reproducing both much better. This independent test agrees with the matched-reference comparison (Section 11.3): the baseline carries a measurable training-patient signal, StyleGAN2 does not.
+The baseline reproduces its training patients significantly better than unseen patients; neither StyleGAN2 model shows a detectable difference, while both reproduce real slices much better than the baseline. The recommended model reconstructs slightly less well than default StyleGAN2 (0.845 against 0.863), consistent with its narrower sample set at this checkpoint (recall 0.18, Section 11.5). This independent test agrees with the matched-reference comparison (Section 11.3): the baseline carries a measurable training-patient signal, StyleGAN2 does not, with or without augmentation.
 
-| Baseline | StyleGAN2 |
-|---|---|
-| ![Baseline inversion](figures/wgan_adni64_iter010000_inversion.png) | ![StyleGAN2 inversion](figures/sg2_adni64_iter010000_inversion.png) |
+| Baseline (10,000) | StyleGAN2 (10,000) | Recommended (17,500) |
+|---|---|---|
+| ![Baseline inversion](figures/wgan_adni64_iter010000_inversion.png) | ![StyleGAN2 inversion](figures/sg2_adni64_iter010000_inversion.png) | ![Recommended inversion](figures/sg2_adni64_augp02_iter017500_inversion.png) |
 
 ### 11.9 Resolution: 128 × 128
 
@@ -699,7 +753,7 @@ All on one NVIDIA A100-PCIE-40GB. The whole project used about 24 A100-hours acr
 | 1. Fidelity: lower FID than the baseline; SSIM > 0.6 | **Met.** Every StyleGAN2 variant beats the baseline by about 4× on FID (11.4–13.7 vs 48.4); median nearest-neighbour SSIM 0.80 (whole) and 0.62 (brain) |
 | 2. No copies among 3,100 slices | **Not reliably met without a filter.** Most snapshots have none, but five runs produced a single copy-level slice in one or two snapshots each. Met for any cohort screened by the release filter (Section 11.12) |
 | 3. Flag rate and excess no higher than the baseline's at equal or better FID | **Met on excess, not on flag rate.** The flag rate measures realism as much as memorisation (Section 11.3); the excess, which separates the two, is significantly lower for StyleGAN2 than for the baseline, and lower still with augmentation |
-| 4. Coverage across both classes and slice positions | **Partly met.** Slice positions are covered. Real AD slices are under-covered by every model; augmentation narrows the gap (80–85% of the reference, against 70% without), conditioning does not, with or without augmentation (Section 11.6) |
+| 4. Coverage across both classes and slice positions | **Partly met.** Slice positions are covered. Real AD slices are under-covered by every model; augmentation narrows the gap (80–85% of the reference, against 70% without), conditioning does not, with or without augmentation (Section 11.6). A dedicated AD/CN classifier finds no shortage of AD-classified slices, so the gap is in the variety of AD anatomy reproduced, not in the number of AD-like slices |
 | 5. One A100, jobs ≤ 12 h, ≤ 24 GPU-hours per configuration | **Met.** 64 px: about 67 minutes and 5.6 GB per run; 128 px: 107 minutes and 9.7 GB per 15,100 iterations |
 
 ### 11.12 Recommendation to the project manager
@@ -707,18 +761,18 @@ All on one NVIDIA A100-PCIE-40GB. The whole project used about 24 A100-hours acr
 **Use StyleGAN2 with fixed-probability discriminator augmentation (p = 0.2) at 64 × 64, trained to about 17,500 iterations, and screen every cohort before release.**
 
 - **Why this configuration and checkpoint.** In two independent runs it is significantly less pulled towards its training patients than default StyleGAN2 from 7,500 iterations on, and the effect replicates in the conditional model. At 17,500 iterations it combines FID 11.9, real-level coverage (0.480), 85% of the real AD coverage and an excess below the control (−0.0016). Training on to 30,200 iterations gives the best FID of any run (10.8) and better recall, at the cost of a slow upward creep in the excess (+0.0018, not significant); that is a reasonable choice if realism matters more than privacy margin. ADA with target 0.4 is an alternative with similar benefits.
-- **Release safeguard (essential, not optional).** Run every generated cohort through the audit (`predict.py`) and drop any slice at or above copy level before sharing. Near-copies are rare (at most one in 3,100 per snapshot) but occur even in augmented runs. Do not judge a cohort by its flag rate alone; use the matched-reference excess.
-- **Not yet suitable for training or testing AD classifiers.** Every generator under-represents AD-typical anatomy (Section 11.6), so a cohort would be biased towards CN. Conditioning, as implemented, did not fix this, even combined with augmentation. A conditional generator evaluated with a dedicated AD/CN classifier, and possibly higher resolution, is needed.
-- **Privacy caveat.** The audit barely recognises a patient across visits (Section 7.3), so it cannot rule out a generator reproducing a training patient's anatomy in a new head position. The inversion test (Section 11.8) found no training-patient advantage for StyleGAN2, which is reassuring but not proof. A feature-space identity check is advisable before any release outside the research team.
+- **Release safeguard (essential, not optional).** Run every generated cohort through the audit (`predict.py`) and drop any slice at or above copy level before sharing. Near-copies are rare (at most one in 3,100 per snapshot) but occur even in augmented runs. Do not judge a cohort by its flag rate alone; use the matched-reference excess. Also drop malformed slices: the recommended model's rare worst outputs are enlarged, stretched or smeared brains (Section 11.7), so a screen on distance from the real data (e.g. slices far outside every real Inception neighbourhood, or with very low similarity to any training slice) should be added, with its threshold calibrated on real validation slices before use.
+- **Not yet suitable for training or testing AD classifiers.** Every generator reaches less of the variety of real AD anatomy than of CN anatomy (Section 11.6), especially large, high-contrast AD slices, so a classifier trained on a synthetic cohort would see a narrow picture of AD. Class-conditional generation is the right starting point for class-balanced cohorts: a dedicated classifier recognises the requested class in 86–96% of AD-requested slices. But conditioning did not widen AD coverage, even with augmentation, and part of what the label controls may be slice level rather than disease anatomy (Discovery 9). Wider coverage of AD anatomy, verified with level-matched comparisons, is needed first.
+- **Privacy caveat.** The audit barely recognises a patient across visits (Section 7.3), so it cannot rule out a generator reproducing a training patient's anatomy in a new head position. The inversion test (Section 11.8) found no training-patient advantage for StyleGAN2, including the recommended configuration at its recommended checkpoint, which is reassuring but not proof. A feature-space identity check is advisable before any release outside the research team.
 
 ### 11.13 Limitations and future work
 
 - **Few repeats.** Only the recommended configuration was replicated (two seeds). Other configurations ran once, so differences of 1–2 FID points between them cannot be attributed to the configuration; seeds alone moved FID by up to 3 points. The large effects (StyleGAN2 vs the baseline; augmentation vs none on the excess) hold across runs.
 - **Resolution.** The main comparison is at 64 × 64. At 128 × 128 the recommended configuration stayed far less diverse (recall 0.07) even after 30,200 iterations, probably because its high-resolution layers are narrow (Section 11.9).
 - **Checkpoint selection on test data.** Checkpoints were compared on test-set metrics (FID and the matched-reference excess both use the test patients), so the chosen checkpoint's numbers are slightly optimistic. A held-out selection split would remove this bias.
-- **Class information.** Inception-v3 features and pixel SSIM are both nearly blind to AD-specific anatomy, so class fidelity is only indirectly measured; conditioning did not improve AD coverage.
+- **Class information.** Inception-v3 features and pixel SSIM are both nearly blind to AD-specific anatomy. The dedicated classifier is better (0.78 test balanced accuracy, also within single slice levels) but moderate and partly level-sensitive, and on generated slices its absolute AD share is affected by the shift away from real data, so only within-model comparisons (conditional label fidelity) are interpreted.
 - **Validation sample size.** The audit threshold rests on 68 validation patients and the matched-reference control on 68 test patients, which is why single-run excess intervals are wide; direct model comparisons avoid this.
-- **Future work:** a conditional generator evaluated with a dedicated AD/CN classifier; wider high-resolution layers and longer training at 128 px; a feature-space identity audit; more seeds per configuration.
+- **Future work:** a stronger, level-matched AD/CN classifier (e.g. trained only on slice indices shared by both classes); wider high-resolution layers and longer training at 128 px; a feature-space identity audit; more seeds per configuration; a held-out split for checkpoint selection.
 
 ## 12. Artificial Intelligence Usage Disclosure
 
@@ -771,6 +825,12 @@ This disclosure follows the UQ Library *Guide to acknowledging and referencing A
 | 27/10/2026 | Claude Opus 5.5 | **Planned:** the 128 px sensitivity run, a second seed, and continuation and combination runs | "yes, wait so after this there are absolutely no more experiments to do?? could we maybe try increasing resolution from 64x64 upwards to see if that will improve results?" | Sections 11.5, 11.9 | Ran all on Rangpur; reported 128 px as not converged rather than as a better or worse model |
 | 28/10/2026 | Claude Opus 5.5 | **Drafted:** README updates for the extension experiments and these log rows | "yes lets do that" | README Sections 5, 6, 10, 11, 12 | Checked every number against the job outputs before committing |
 | 28/10/2026 | Claude Opus 5.5 | **Analysed / drafted:** results of the continued augmentation run, conditional + augmentation and the continued 128 px run; wrote the text replacing the README placeholders, including a revised checkpoint recommendation (17,500 iterations) and a new limitation (checkpoints chosen on test data), and applied all final edits to this README | Pasting the six job logs and the `sacct` output, uploading the figures, and "can i just give you the readme.md file and you give me back the full copy and pasteable updated finalised one?" | README Sections 11.3–11.13 | Checked every number against the job outputs and read the final README end to end before committing |
+| 28/10/2026 | Claude Opus 5.5 | **Reviewed / planned:** read the fork end to end against the specification and marking criteria; found that the failure autopsy, uncurated grids and latent analysis used default StyleGAN2 at 10,000 iterations rather than the recommended checkpoint, an ambiguous ADA row in the fidelity table, and functions without docstrings; proposed the order of remaining work and extensions | "I want to finalise this report … As it stands how close am i to getting full marks? what more can i do?" | Whole README; code | I checked each finding against the README and code on GitHub before acting on it |
+| 28/10/2026 | Claude Opus 5.5 | **Generated code:** one-line docstrings for public functions that lacked them (no code changes); two of Claude's first drafts overstated what a function does and were corrected after Claude checked them against the code | "lets as much of it done today as possible!!!" | All `.py` files | Pyflakes and compile checks passed; I reviewed the diff (37 added lines, docstrings only) before committing |
+| 28/10/2026 | Claude Opus 5.5 | **Analysed / drafted:** interpreted the autopsy and latent analysis of the recommended checkpoint (jobs 709155, 709168) and drafted Sections 11.7 and 11.8 and the related edits; identified the new "malformed outlier" finding and presented the augmentation-leaking explanation as an untested hypothesis | Pasting both job logs and uploading the five figures | README Sections 1, 11.6–11.8, 11.12 | Checked every number against the two logs; the AD coverage from the autopsy (0.343, 85% of the reference) independently matched the value from `predict.py` |
+| 28/10/2026 | Claude Opus 5.5 | **Generated code:** wrote `classify.py` and `classify.sh` (AD/CN CNN, level-only confound baseline, within-level accuracy, faithful-generator reference, conditional label fidelity). Claude's synthetic test exposed two of its own errors, both fixed before the Rangpur run: a wrong parameter count in a docstring, and a confound baseline built on within-window position, which cannot detect the class-dependent slice level of Discovery 9 | "yes" (to the proposed classifier), "lets as much of it done today as possible!!!" | `classify.py`, `classify.sh` | Tested on synthetic data with a planted anatomy difference and a planted level confound: the level-only baseline detected the confound, the within-level check isolated the anatomy signal, and a positive-control generator scored 98–102% of the expected share. Ran on Rangpur (job 709310) |
+| 28/10/2026 | Claude Opus 5.5 | **Analysed / drafted:** interpreted the classifier results and drafted the new Section 11.6 block and the revisions they forced: the Inception class vote's "too few AD-like slices" conclusion, which Claude had drafted on 25/10, was withdrawn, and the claim that conditioning has a small effect was corrected | Pasting the job log and uploading the figure | README Sections 1, 6, 10, 11.6, 11.7, 11.11–11.13 | Checked every number against job 709310; checked that the baseline's AD share matched StyleGAN2's before concluding that the absolute share does not rank generators |
+| 28/10/2026 | Claude Opus 5.5 | **Reviewed / edited:** found works used or cited in the README but missing from the reference list (projection discriminator, FID, precision/recall, density/coverage, R1, Inception-v3, t-SNE) and added them | "is that everything you need?" | Sections 1, 6, 11.2, 13 | Checked each title, venue and year against the paper |
 
 ### 12.3 Verification approach
 
@@ -792,3 +852,10 @@ Guidance followed: The University of Queensland Library. *Guide to acknowledging
 - Z. Wang, A. C. Bovik, H. R. Sheikh, and E. P. Simoncelli, "Image quality assessment: from error visibility to structural similarity," IEEE Transactions on Image Processing, vol. 13, no. 4, pp. 600–612, 2004.
 - I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, and A. Courville, "Improved training of Wasserstein GANs," in Proc. NeurIPS, 2017.
 - T. Karras, M. Aittala, J. Hellsten, S. Laine, J. Lehtinen, and T. Aila, "Training generative adversarial networks with limited data," in Proc. NeurIPS, 2020.
+- T. Miyato and M. Koyama, "cGANs with projection discriminator," in Proc. ICLR, 2018.
+- M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter, "GANs trained by a two time-scale update rule converge to a local Nash equilibrium," in Proc. NeurIPS, 2017.
+- T. Kynkäänniemi, T. Karras, S. Laine, J. Lehtinen, and T. Aila, "Improved precision and recall metric for assessing generative models," in Proc. NeurIPS, 2019.
+- M. F. Naeem, S. J. Oh, Y. Uh, Y. Choi, and J. Yoo, "Reliable fidelity and diversity metrics for generative models," in Proc. ICML, 2020.
+- L. Mescheder, A. Geiger, and S. Nowozin, "Which training methods for GANs do actually converge?," in Proc. ICML, 2018.
+- C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, and Z. Wojna, "Rethinking the Inception architecture for computer vision," in Proc. CVPR, 2016.
+- L. van der Maaten and G. Hinton, "Visualizing data using t-SNE," Journal of Machine Learning Research, vol. 9, pp. 2579–2605, 2008.
