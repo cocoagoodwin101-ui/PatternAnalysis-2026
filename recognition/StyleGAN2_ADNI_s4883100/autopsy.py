@@ -45,6 +45,7 @@ CLASS_AD = 1
 
 
 def load_snapshot(run_dir, it, device):
+    """Load a run's config and the EMA generator snapshot saved at iteration `it`."""
     config, snaps = load_run(run_dir)
     match = [p for p in snaps if snapshot_iter(p) == it]
     if not match:
@@ -102,6 +103,7 @@ def plot_autopsy(rows, path, title, copy_level):
 
 
 def main():
+    """Generate a cohort from one snapshot, select failure cases by fixed rules, and save the autopsy figure and uncurated grids."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Rule-based failure autopsy with nearest-neighbour checks.")
     p.add_argument("--run_name", required=True)

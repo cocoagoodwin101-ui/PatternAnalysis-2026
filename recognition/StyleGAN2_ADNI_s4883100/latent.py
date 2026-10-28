@@ -39,10 +39,12 @@ from predict import audit_generated, build_generator, load_run, snapshot_iter
 
 
 def to_uint8(x):
+    """Map images from [-1, 1] to uint8 [0, 255]."""
     return ((x.clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
 
 
 def is_stylegan(config):
+    """True if the run's config describes a StyleGAN2 generator."""
     return config["model"] == "stylegan2"
 
 
@@ -54,6 +56,7 @@ def latent_to_image(G, config, latent):
 
 
 def sample_latents(G, config, n, gen):
+    """Sample n latents: w = mapping(z) for StyleGAN2, z for the WGAN-GP baseline."""
     z = torch.randn(n, config["latent_dim"], device=gen.device, generator=gen)
     if is_stylegan(config):
         with torch.no_grad():
@@ -62,6 +65,7 @@ def sample_latents(G, config, n, gen):
 
 
 def interpolate(a, b, steps, config):
+    """Return `steps` latents from a to b: linear in W for StyleGAN2, spherical in z for the baseline."""
     t = torch.linspace(0, 1, steps, device=a.device).view(-1, 1)
     if is_stylegan(config):
         return a * (1 - t) + b * t  # linear in W
@@ -110,6 +114,7 @@ def one_per_patient(split, n, gen):
 
 
 def plot_interpolation(rows, path, title, copy_level):
+    """Plot interpolation paths with each frame's nearest-training SSIM (red at or above copy level)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -142,6 +147,7 @@ def plot_interpolation(rows, path, title, copy_level):
 
 
 def plot_inversion(train_q, test_q, examples, path, title):
+    """Plot the inversion membership test: reconstruction quality for training vs unseen patients, plus examples."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -169,6 +175,7 @@ def plot_inversion(train_q, test_q, examples, path, title):
 
 
 def main():
+    """Run latent interpolation with nearest-neighbour tracking and the inversion membership test for one snapshot."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Latent interpolation and inversion-based membership test.")
     p.add_argument("--run_name", required=True)

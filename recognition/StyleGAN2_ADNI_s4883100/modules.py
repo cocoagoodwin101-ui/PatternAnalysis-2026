@@ -115,6 +115,7 @@ def gradient_penalty(critic, real, fake):
 
 
 def count_parameters(model):
+    """Total number of parameters in a model."""
     return sum(p.numel() for p in model.parameters())
 
 
@@ -300,6 +301,7 @@ class StyleGAN2Generator(nn.Module):
         self.num_ws = len(self.layers) + 1
 
     def synthesis(self, ws, noise_mode="random"):
+        """Run the synthesis network on per-layer styles `ws` (B, n_ws, w_dim); noise_mode 'none' disables per-pixel noise."""
         b = ws.size(0)
         x = self.const.expand(b, -1, -1, -1)
         zero_noise = noise_mode == "none"  # "none" switches per-pixel noise off (deterministic output)
@@ -365,6 +367,7 @@ class StyleGAN2Discriminator(nn.Module):
         self.embed = EqualLinear(c_dim, ch[4]) if c_dim > 0 else None
 
     def minibatch_std(self, x):
+        """Append one feature map holding the mean standard deviation across each group of samples (exposes low variety)."""
         b, c, h, w = x.shape
         g = min(self.mbstd_group, b)
         while b % g:  # group size must divide the batch

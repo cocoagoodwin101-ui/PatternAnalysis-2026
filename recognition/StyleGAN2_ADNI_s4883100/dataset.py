@@ -362,6 +362,7 @@ def _print_split_table(splits):
 
 
 def main():
+    """Smoke test: build the leakage-free split, check for patient overlap and print split statistics, and save a batch of preprocessed slices."""
     from torchvision.utils import save_image
 
     here = os.path.dirname(os.path.abspath(__file__))

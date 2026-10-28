@@ -49,10 +49,12 @@ def knn_vote(query, ref, ref_labels, k=10, device="cpu", chunk=1024):
 
 
 def balanced_accuracy(pred, true):
+    """Mean per-class recall of `pred` against `true` (both 1-D label tensors)."""
     return float(np.mean([(pred[true == c] == c).float().mean() for c in true.unique()]))
 
 
 def embed(features, seed, perplexity):
+    """Reduce features to 50 dimensions with PCA, then to 2-D with t-SNE."""
     from sklearn.decomposition import PCA
     from sklearn.manifold import TSNE
     x = features.numpy().astype(np.float64)
@@ -62,6 +64,7 @@ def embed(features, seed, perplexity):
 
 
 def plot(xy, groups, real_labels, real_pos, runs, path, gen_labels, title):
+    """Plot the joint t-SNE: real slices by class and by slice position, then each run's generated slices over the real slices."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -114,6 +117,7 @@ def plot(xy, groups, real_labels, real_pos, runs, path, gen_labels, title):
 
 
 def main():
+    """Embed real test slices and each run's generated slices jointly, run the k-NN class vote (--k, default 10), and save the figure and summary."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Joint t-SNE embedding of real and generated slices.")
     p.add_argument("--runs", nargs="+", required=True, help="run_name or run_name:iteration (default: last snapshot)")

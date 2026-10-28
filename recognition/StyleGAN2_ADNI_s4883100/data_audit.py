@@ -37,6 +37,7 @@ SPLITS = ["train", "test"]
 
 
 def parse_args():
+    """Parse command-line options for the dataset audit."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", default=DEFAULT_ROOT, help="ADNI directory containing AD_NC/ and the metadata JSON")
@@ -153,6 +154,7 @@ def check_labels_and_subjects(scans, subjects):
 # Figures
 # --------------------------------------------------------------------------- #
 def save(fig, out, name):
+    """Save a figure to `out/name` at 150 dpi and close it."""
     path = os.path.join(out, name)
     fig.tight_layout(rect=(0, 0, 1, 0.94))  # leave room for the suptitle
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -476,6 +478,7 @@ def fig_intensity(scans, out, rng, n_per_class):
 
 # --------------------------------------------------------------------------- #
 def main():
+    """Run every dataset check (files, slice structure, labels and subjects, brain extent, scan quality) and write the README figures."""
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(args.seed)

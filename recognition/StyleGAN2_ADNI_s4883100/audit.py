@@ -360,6 +360,7 @@ RUNG_ROLE = {"near_duplicate": "copy", "same_session": "copy", "different_day": 
 
 
 def percentiles(v, ps=(5, 50, 95)):
+    """Return the given percentiles of a 1-D tensor (NaNs if it is empty)."""
     v = v.float()
     return [float(torch.quantile(v, p / 100)) for p in ps] if len(v) else [float("nan")] * len(ps)
 
@@ -403,6 +404,7 @@ def summarise(rungs, thresholds, threshold_pct):
 
 
 def plot_ladder(rungs, thresholds, path, resolution, threshold_pct):
+    """Plot the similarity ladder (each rung's SSIM distribution) per class and metric, with the calibrated thresholds."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -432,6 +434,7 @@ def plot_ladder(rungs, thresholds, path, resolution, threshold_pct):
 
 
 def main():
+    """Calibrate the audit: compute every rung of the similarity ladder on real data, then save thresholds, summaries and the ladder figure."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Calibrate the memorisation-audit similarity ladder on real ADNI data.")
     p.add_argument("--resolution", type=int, default=64,

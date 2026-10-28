@@ -108,10 +108,12 @@ def load_run(run_dir):
 
 
 def snapshot_iter(path):
+    """Training iteration encoded in a snapshot filename (generator_NNNNNN.pt)."""
     return int(re.search(r"generator_(\d+)\.pt$", path).group(1))
 
 
 def build_generator(config, device):
+    """Construct an empty generator matching a run's config (weights are loaded separately)."""
     if config["model"] == "wgan-gp":
         return WGANGenerator(config["latent_dim"], config["resolution"]).to(device)
     if config["model"] == "stylegan2":  # snapshots hold the EMA generator; sampled without truncation
@@ -183,6 +185,7 @@ def audit_generated(gen_images, train_index, device, brain_threshold):
 
 
 def summarise(res, ref, n):
+    """Flag counts, Wilson 95% intervals and nearest-neighbour SSIM percentiles for each audit metric."""
     out = {}
     for metric in ("whole", "masked"):
         v = res[metric]
@@ -223,6 +226,7 @@ def memorisation_checks(res, ladder, ref, subject_idx):
 
 
 def print_checks(it, checks):
+    """Print the neighbour-concentration and copy-level checks for one snapshot."""
     for metric in ("whole", "masked"):
         c = checks[metric]
         for name in ("generated", "test_strangers"):
@@ -333,10 +337,12 @@ def model_difference(gap_a, gap_b, n_boot=2000, seed=0):
 
 
 def strip_per_query(gap):
+    """Drop per-query arrays from a matched-reference result before writing it to JSON."""
     return {m: {k: v for k, v in d.items() if k != "per_query"} for m, d in gap.items()}
 
 
 def print_gap(label, metric, g):
+    """Print one row of the matched-reference (training vs unseen) comparison."""
     print(f"{label:>14} {metric:<7} {g['train_p50']:>9.4f} {g['val_p50']:>9.4f} "
           f"{g['diff_mean']:>+9.4f} [{g['diff_range'][0]:+.4f}, {g['diff_range'][1]:+.4f}] "
           f"{g['closer_to_train']:>7.1%} [{g['closer_range'][0]:.1%}, {g['closer_range'][1]:.1%}]")
@@ -365,6 +371,7 @@ def inception_features(model, images_uint8, device, batch=250):
 
 
 def fid_from_features(a, b):
+    """Frechet Inception Distance between two feature sets (rows are samples)."""
     from pytorch_fid.fid_score import calculate_frechet_distance
     a, b = a.numpy(), b.numpy()
     return float(calculate_frechet_distance(a.mean(0), np.cov(a, rowvar=False), b.mean(0), np.cov(b, rowvar=False)))
@@ -409,6 +416,7 @@ def class_coverage(test_feats, test_labels, feats, labels=None, k=5, device="cpu
 
 
 def fidelity(feats, test_feats, device, test_labels=None, labels=None):
+    """FID, precision, recall, density and coverage of generated features against test features (plus per-class coverage if labels are given)."""
     p, r = precision_recall(test_feats, feats, device=device)
     dens, cov = density_coverage(test_feats, feats, device=device)
     out = dict(fid=fid_from_features(feats, test_feats), precision=p, recall=r, density=dens, coverage=cov,
@@ -458,6 +466,7 @@ def plot_tradeoff(runs, fid_ref, ref_flag_rate, path):
 
 
 def plot_distributions(res, ladder, ref, path, title):
+    """Plot the generated cohort's nearest-training SSIM distribution against the calibrated ladder rungs."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -513,6 +522,7 @@ def plot_nearest(gen_images, train_images, res, path, title, seed, k=8):
 
 # --------------------------------------------------------------------------- #
 def main():
+    """Evaluate one or all snapshots of a run: memorisation audit, matched-reference excess, fidelity metrics and figures."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Generate slices from a trained model and audit them for memorisation.")
     p.add_argument("--run_name", required=True)

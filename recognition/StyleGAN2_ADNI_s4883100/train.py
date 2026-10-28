@@ -85,6 +85,7 @@ class GPUBatches:
         self.epoch, self._perm, self._pos = 0, None, len(self.images)
 
     def next(self):
+        """Return the next batch in [-1, 1], reshuffling at each epoch (labels of the batch are kept in last_labels)."""
         if self._pos + self.batch_size > len(self.images):
             self._perm = torch.randperm(len(self.images), device=self.images.device, generator=self.gen)
             self._pos = 0
@@ -155,6 +156,7 @@ def plot_history(history, path, panels):
 # Training
 # --------------------------------------------------------------------------- #
 def train_wgan_gp(args, batches, device, run_dir):
+    """Train the WGAN-GP baseline (Lab 2 port) with versioned snapshots, loss logging and resume support."""
     generator = WGANGenerator(args.latent_dim, args.resolution).to(device)
     critic = WGANCritic(args.resolution).to(device)
     g_opt = optim.Adam(generator.parameters(), lr=args.lr, betas=(0.0, 0.9))
@@ -247,6 +249,7 @@ def stylegan2_settings(args):
 
 
 def train_stylegan2(args, batches, device, run_dir):
+    """Train StyleGAN2 (non-saturating loss, lazy R1, EMA generator, optional augmentation and class conditioning)."""
     c_dim = 2 if args.conditional else 0
     G = StyleGAN2Generator(args.resolution, z_dim=args.latent_dim, channel_base=args.channel_base,
                            max_channels=args.max_channels, c_dim=c_dim).to(device)
@@ -397,6 +400,7 @@ MODEL_DEFAULTS = {"wgan-gp": dict(lr=1e-4, latent_dim=100), "stylegan2": dict(lr
 
 
 def main():
+    """Parse options, load the training split, and train the chosen model."""
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description="Train a generative model on ADNI or OASIS brain slices.")
     p.add_argument("--model", choices=["wgan-gp", "stylegan2"], default="wgan-gp")
