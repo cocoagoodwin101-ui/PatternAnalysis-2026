@@ -265,7 +265,7 @@ def plot_summary(real_test, p_test, test_labels, runs, path, expected):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.6), gridspec_kw=dict(width_ratios=[1, 1.2]))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5.6), gridspec_kw=dict(width_ratios=[1, 1.3]))
     bins = torch.linspace(0, 1, 26).numpy()
     a1.hist(p_test[test_labels == 0].numpy(), bins=bins, density=True, histtype="step", lw=2, color="#4C72B0",
             label="real test CN")
@@ -275,10 +275,10 @@ def plot_summary(real_test, p_test, test_labels, runs, path, expected):
         a1.hist(p.numpy(), bins=bins, density=True, histtype="step", lw=1.2, ls="--", label=f"{r['run']} @ {r['iter']}")
     a1.set_xlabel("classifier AD probability")
     a1.set_ylabel("density")
-    a1.legend(fontsize=7)
+    a1.legend(fontsize=6.5, loc="upper center")
     a1.set_title("What the classifier sees", fontsize=10)
 
-    names = [f"{r['run']}\n@ {r['iter']}" for r, _, _ in runs]
+    names = [f"{r['run']} @ {r['iter']}" for r, _, _ in runs]
     shares = [r["predicted_ad_share"] for r, _, _ in runs]
     errs = [[s - r["predicted_ad_share_ci95"][0] for s, (r, _, _) in zip(shares, runs)],
             [r["predicted_ad_share_ci95"][1] - s for s, (r, _, _) in zip(shares, runs)]]
@@ -288,7 +288,7 @@ def plot_summary(real_test, p_test, test_labels, runs, path, expected):
     a2.axhline(real_test["predicted_ad_share"], color="#C44E52", lw=1.5)
     a2.axhline(expected, color="black", ls="--", lw=1.2, label="expected for a faithful generator")
     a2.set_xticks(range(len(runs)))
-    a2.set_xticklabels(names, fontsize=7)
+    a2.set_xticklabels(names, fontsize=7, rotation=35, ha="right", rotation_mode="anchor")
     a2.set_ylabel("share classified AD")
     a2.legend(fontsize=7, loc="upper right")
     a2.set_title("Predicted AD share of each generated cohort", fontsize=10)
